@@ -1,0 +1,15 @@
+{
+  "id": "@sas/synth-generator",
+  "displayName": "Synths",
+  "version": "1.0.0",
+  "description": "AI-powered MIDI generation with Surge XT synthesis",
+  "generatorType": "midi",
+  "main": "index.js",
+  "author": "Signals & Sorcery",
+  "minHostVersion": "1.0.0",
+  "builtIn": true,
+  "capabilities": {
+    "requiresLLM": true,
+    "requiresSurgeXT": true
+  }
+}
