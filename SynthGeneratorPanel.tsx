@@ -1,5 +1,5 @@
 /**
- * SynthGeneratorPanel — Real UI for the @sas/synth-generator plugin
+ * SynthGeneratorPanel — Real UI for the @signalsandsorcery/synth-generator plugin
  *
  * Renders the synth track list with prompt input, MIDI generation,
  * and track controls. Uses ONLY PluginHost SDK methods — no EngineContext,

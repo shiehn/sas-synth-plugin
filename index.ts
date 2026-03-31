@@ -1,5 +1,5 @@
 /**
- * @sas/synth-generator — Built-in Synth Generator Plugin
+ * @signalsandsorcery/synth-generator — Built-in Synth Generator Plugin
  *
  * AI-powered MIDI generation with Surge XT synthesis.
  * Supports single and bulk track generation, preset management,
@@ -17,7 +17,7 @@ import type {
 import { SynthGeneratorPanel } from './SynthGeneratorPanel';
 
 export class SynthGeneratorPlugin implements GeneratorPlugin {
-  readonly id = '@sas/synth-generator';
+  readonly id = '@signalsandsorcery/synth-generator';
   readonly displayName = 'Synths';
   readonly version = '1.0.0';
   readonly description = 'AI-powered MIDI generation with Surge XT synthesis';

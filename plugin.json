@@ -1,5 +1,5 @@
 {
-  "id": "@sas/synth-generator",
+  "id": "@signalsandsorcery/synth-generator",
   "displayName": "Synths",
   "version": "1.0.0",
   "description": "AI-powered MIDI generation with Surge XT synthesis",
