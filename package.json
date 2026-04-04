@@ -1,0 +1,21 @@
+{
+  "name": "@signalsandsorcery/synth-generator",
+  "version": "1.0.0",
+  "description": "AI-powered MIDI generation with Surge XT synthesis",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch"
+  },
+  "dependencies": {
+    "@signalsandsorcery/plugin-sdk": "^1.1.0"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0"
+  },
+  "peerDependencies": {
+    "react": "^18.0.0"
+  },
+  "license": "MIT"
+}
