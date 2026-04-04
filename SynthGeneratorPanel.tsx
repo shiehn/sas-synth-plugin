@@ -71,6 +71,7 @@ interface SynthTrackState {
   instrumentName: string | null;
   instrumentMissing: boolean;
   instrumentDrawerOpen: boolean;
+  instrumentDrawerStage: 'instruments' | 'editor';
 }
 
 /** Shape of the parsed LLM JSON response */
@@ -208,6 +209,7 @@ export function SynthGeneratorPanel({
           instrumentName: handle.instrumentName ?? null,
           instrumentMissing,
           instrumentDrawerOpen: false,
+          instrumentDrawerStage: 'instruments',
         });
       }
       setTracks(trackStates);
@@ -354,6 +356,7 @@ export function SynthGeneratorPanel({
         instrumentName: null,
         instrumentMissing: false,
         instrumentDrawerOpen: false,
+        instrumentDrawerStage: 'instruments',
       };
       setTracks(prev => [...prev, newTrack]);
       onExpandSelf?.();
@@ -640,7 +643,7 @@ export function SynthGeneratorPanel({
   const handleShuffle = useCallback(async (trackId: string): Promise<void> => {
     try {
       const result = await host.shufflePreset(trackId);
-      host.showToast('success', 'Preset shuffled', result.presetName);
+      console.log(`[SynthGenerator] Preset shuffled: ${result.presetName}`);
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Shuffle failed';
       host.showToast('error', 'Shuffle failed', msg);
@@ -704,7 +707,7 @@ export function SynthGeneratorPanel({
 
   const toggleFxDrawer = useCallback((trackId: string): void => {
     setTracks(prev => prev.map(t =>
-      t.handle.id === trackId ? { ...t, fxDrawerOpen: !t.fxDrawerOpen, instrumentDrawerOpen: false } : t
+      t.handle.id === trackId ? { ...t, fxDrawerOpen: !t.fxDrawerOpen, instrumentDrawerOpen: false, instrumentDrawerStage: 'instruments' as const } : t
     ));
     // Refresh FX state when opening drawer
     const track = tracks.find(t => t.handle.id === trackId);
@@ -726,12 +729,14 @@ export function SynthGeneratorPanel({
 
   // --- Instrument selection callbacks ------------------------------------
   const toggleInstrumentDrawer = useCallback((trackId: string): void => {
-    // Close FX drawer when opening instrument drawer and vice versa
-    setTracks(prev => prev.map((t: SynthTrackState) =>
-      t.handle.id === trackId
-        ? { ...t, instrumentDrawerOpen: !t.instrumentDrawerOpen, fxDrawerOpen: false }
-        : t
-    ));
+    // Close FX drawer when opening instrument drawer.
+    // If track has a custom instrument, open to editor stage; otherwise instrument list.
+    setTracks(prev => prev.map((t: SynthTrackState) => {
+      if (t.handle.id !== trackId) return t;
+      const opening = !t.instrumentDrawerOpen;
+      const stage = opening && t.instrumentPluginId ? 'editor' as const : 'instruments' as const;
+      return { ...t, instrumentDrawerOpen: opening, fxDrawerOpen: false, instrumentDrawerStage: stage };
+    }));
     // Lazy-load available instruments on first drawer open
     if (availableInstruments.length === 0 && !instrumentsLoading) {
       setInstrumentsLoading(true);
@@ -743,14 +748,17 @@ export function SynthGeneratorPanel({
     }
   }, [host, availableInstruments.length, instrumentsLoading]);
 
-  const handleInstrumentSelect = useCallback((trackId: string, pluginId: string): void => {
-    // Optimistically close the drawer
-    setTracks(prev => prev.map((t: SynthTrackState) =>
-      t.handle.id === trackId ? { ...t, instrumentDrawerOpen: false } : t
-    ));
-    host.setTrackInstrument(trackId, pluginId).then(() => {
-      // Reload instrument info from host
-      host.getTrackInstrument(trackId).then((descriptor: InstrumentDescriptor | null) => {
+  const handleInstrumentSelect = useCallback(async (trackId: string, pluginId: string): Promise<void> => {
+    const isSurgeXt = pluginId === 'Surge XT';
+
+    if (isSurgeXt) {
+      // Revert to default — close drawer
+      setTracks(prev => prev.map((t: SynthTrackState) =>
+        t.handle.id === trackId ? { ...t, instrumentDrawerOpen: false, instrumentDrawerStage: 'instruments' as const } : t
+      ));
+      try {
+        await host.setTrackInstrument(trackId, pluginId);
+        const descriptor = await host.getTrackInstrument(trackId);
         setTracks(prev => prev.map((t: SynthTrackState) =>
           t.handle.id === trackId
             ? {
@@ -761,13 +769,57 @@ export function SynthGeneratorPanel({
               }
             : t
         ));
-      }).catch(() => {});
-    }).catch((err: unknown) => {
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Failed to load instrument';
+        host.showToast('error', 'Instrument load failed', msg);
+      }
+      return;
+    }
+
+    // Custom instrument — load it, then transition to preset stage
+    setTracks(prev => prev.map((t: SynthTrackState) =>
+      t.handle.id === trackId ? { ...t, instrumentDrawerStage: 'editor' as const } : t
+    ));
+
+    try {
+      await host.setTrackInstrument(trackId, pluginId);
+      const descriptor = await host.getTrackInstrument(trackId);
+      setTracks(prev => prev.map((t: SynthTrackState) =>
+        t.handle.id === trackId
+          ? {
+              ...t,
+              instrumentPluginId: descriptor?.pluginId ?? null,
+              instrumentName: descriptor?.name ?? null,
+              instrumentMissing: descriptor?.missing ?? false,
+            }
+          : t
+      ));
+
+    } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Failed to load instrument';
       console.error('[SynthGeneratorPanel] Failed to set instrument:', err);
       host.showToast('error', 'Instrument load failed', msg);
-    });
+      // Revert to instrument stage on failure
+      setTracks(prev => prev.map((t: SynthTrackState) =>
+        t.handle.id === trackId ? { ...t, instrumentDrawerStage: 'instruments' as const } : t
+      ));
+    }
   }, [host]);
+
+  const handleShowEditor = useCallback(async (trackId: string): Promise<void> => {
+    try {
+      await host.showInstrumentEditor(trackId);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to open editor';
+      host.showToast('error', 'Editor failed', msg);
+    }
+  }, [host]);
+
+  const handleBackToInstruments = useCallback((trackId: string): void => {
+    setTracks(prev => prev.map((t: SynthTrackState) =>
+      t.handle.id === trackId ? { ...t, instrumentDrawerStage: 'instruments' as const } : t
+    ));
+  }, []);
 
   const handleRefreshInstruments = useCallback((): void => {
     setInstrumentsLoading(true);
@@ -880,6 +932,9 @@ export function SynthGeneratorPanel({
                 onInstrumentSelect={(pluginId: string) => handleInstrumentSelect(loadedTrack.handle.id, pluginId)}
                 instrumentsLoading={instrumentsLoading}
                 onRefreshInstruments={handleRefreshInstruments}
+                instrumentDrawerStage={loadedTrack.instrumentDrawerStage}
+                onShowEditor={() => handleShowEditor(loadedTrack.handle.id)}
+                onBackToInstruments={() => handleBackToInstruments(loadedTrack.handle.id)}
               />
             );
           }
@@ -950,6 +1005,9 @@ export function SynthGeneratorPanel({
             onInstrumentSelect={(pluginId: string) => handleInstrumentSelect(track.handle.id, pluginId)}
             instrumentsLoading={instrumentsLoading}
             onRefreshInstruments={handleRefreshInstruments}
+            instrumentDrawerStage={track.instrumentDrawerStage}
+            onShowEditor={() => handleShowEditor(track.handle.id)}
+            onBackToInstruments={() => handleBackToInstruments(track.handle.id)}
           />
         ))
       )}
