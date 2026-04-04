@@ -13,7 +13,7 @@ import type {
   PluginUIProps,
   PluginSettingsSchema,
   MusicalContext,
-} from '../../../shared/types/plugin-sdk.types';
+} from '@signalsandsorcery/plugin-sdk';
 import { SynthGeneratorPanel } from './SynthGeneratorPanel';
 
 export class SynthGeneratorPlugin implements GeneratorPlugin {

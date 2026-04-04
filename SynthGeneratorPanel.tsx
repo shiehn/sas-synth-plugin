@@ -19,10 +19,10 @@ import type {
   PluginMidiNote,
   BulkAddPlaceholderTrack,
   InstrumentDescriptor,
-} from '../../../shared/types/plugin-sdk.types';
-import { TrackRow, useSceneState, SorceryProgressBar, VALID_INSTRUMENT_ROLES } from '../../sdk';
-import type { FxCategory, TrackFxDetailState } from '../../../shared/types/fx-toggle.types';
-import { EMPTY_FX_DETAIL_STATE } from '../../../shared/types/fx-toggle.types';
+  FxCategory,
+  TrackFxDetailState,
+} from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, useSceneState, SorceryProgressBar, VALID_INSTRUMENT_ROLES, EMPTY_FX_DETAIL_STATE } from '@signalsandsorcery/plugin-sdk';
 
 // ============================================================================
 // Constants
