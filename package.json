@@ -1,21 +1,37 @@
 {
   "name": "@signalsandsorcery/synth-generator",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "AI-powered MIDI generation with Surge XT synthesis",
-  "main": "dist/index.js",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./plugin.json": "./plugin.json"
+  },
   "scripts": {
     "build": "tsup",
-    "dev": "tsup --watch"
-  },
-  "dependencies": {
-    "@signalsandsorcery/plugin-sdk": "^1.1.0"
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
   },
   "devDependencies": {
+    "@signalsandsorcery/plugin-sdk": "file:../sas-plugin-sdk",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
     "tsup": "^8.0.0",
     "typescript": "^5.3.0"
   },
   "peerDependencies": {
-    "react": "^18.0.0"
+    "@signalsandsorcery/plugin-sdk": "*",
+    "react": ">=18",
+    "react-dom": ">=18"
   },
   "license": "MIT"
 }

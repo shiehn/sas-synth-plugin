@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, useSceneState, SorceryProgressBar, VALID_INSTRUMENT_ROLES, EMPTY_FX_DETAIL_STATE } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, useSceneState, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks } from '@signalsandsorcery/plugin-sdk';
 
 // ============================================================================
 // Constants
@@ -32,7 +32,14 @@ const MAX_TRACKS = 16;
 const ESTIMATED_GENERATION_MS = 15000;
 const EMPTY_PLACEHOLDERS: BulkAddPlaceholderTrack[] = [];
 
-const MIDI_SYSTEM_PROMPT = `You are a MIDI composition AI. Given a musical context and text description, generate MIDI notes.
+/**
+ * Build the MIDI system prompt using the host's canonical role list
+ * (host.getValidRoles()) so the LLM emits a role value the classifier
+ * understands. See `src/music-engine/constants/instrument-classification.ts`
+ * — the assistant-side single source of truth.
+ */
+function buildMidiSystemPrompt(validRoles: readonly string[]): string {
+  return `You are a MIDI composition AI. Given a musical context and text description, generate MIDI notes.
 
 Respond with ONLY a JSON object in this format:
 {
@@ -49,7 +56,8 @@ Rules:
 - velocity: 1-127
 - Keep notes within the key and scale provided
 - Match the style described in the prompt
-- role: instrument role — MUST be one of: ${VALID_INSTRUMENT_ROLES.join(', ')}`;
+- role: instrument role — MUST be one of: ${validRoles.join(', ')}`;
+}
 
 // ============================================================================
 // Types
@@ -72,6 +80,15 @@ interface SynthTrackState {
   instrumentMissing: boolean;
   instrumentDrawerOpen: boolean;
   instrumentDrawerStage: 'instruments' | 'editor';
+  /**
+   * Per-track shuffle history. Set of Surge XT preset names already
+   * handed back since the track was created OR since the history was
+   * reset (which happens automatically when the category pool is
+   * exhausted — host.shufflePreset throws "no presets available" and
+   * we wipe the history and retry). Cycle pattern: cycle through every
+   * preset in the category before any repeat.
+   */
+  shuffleHistory: Set<string>;
 }
 
 /** Shape of the parsed LLM JSON response */
@@ -108,19 +125,48 @@ export function SynthGeneratorPanel({
   const engineToDbIdRef = useRef<Map<string, string>>(new Map());
 
   // --- Load tracks when scene changes -----------------------------------
+  // Stale-scene guard: tracks state is keyed implicitly by activeSceneId,
+  // but React holds the prior scene's tracks until loadTracks finishes its
+  // async fetch (engine list + DB query + per-track info ~hundreds of ms).
+  // During that window the panel renders the OLD scene's tracks under the
+  // NEW scene's header — a "ghost track" symptom that goes away on re-mount.
+  // Clear on real scene transitions so the gap is empty, not stale.
+  const tracksLoadedForSceneRef = useRef<string | null>(null);
   const loadTracks = useCallback(async (incremental = false): Promise<void> => {
-    if (!activeSceneId) {
+    // Snapshot the scene this load is for. Each subsequent await is a chance
+    // for `activeSceneId` to change (user switches scene mid-load) or for a
+    // newer loadTracks to take over (newer call writes a different value to
+    // `tracksLoadedForSceneRef`). When that happens, this load must NOT call
+    // `setTracks(...)` — otherwise the old scene's results overwrite the new
+    // scene's panel state, surfacing as phantom tracks under the new scene.
+    const sceneAtStart = activeSceneId;
+    if (!sceneAtStart) {
       setTracks([]);
+      tracksLoadedForSceneRef.current = null;
       return;
     }
+
+    // Scene changed since the last load → clear immediately so the user
+    // sees the new (empty) state, not the prior scene's tracks. Don't
+    // clear for incremental reloads on the SAME scene (bulk completion
+    // re-fetches mid-flight and we want to keep showing tracks then).
+    if (!incremental && tracksLoadedForSceneRef.current !== sceneAtStart) {
+      setTracks([]);
+    }
+    tracksLoadedForSceneRef.current = sceneAtStart;
+
+    const isStale = (): boolean => tracksLoadedForSceneRef.current !== sceneAtStart;
 
     // Only show "Loading tracks..." when there are no tracks yet (initial load).
     // Incremental reloads (re-adoption, bulk completion) keep existing tracks visible.
     if (!incremental) setIsLoadingTracks(true);
     try {
       await host.adoptSceneTracks();
+      if (isStale()) return;
       const handles = await host.getPluginTracks();
-      const sceneData = await host.getAllSceneData(activeSceneId) as Record<string, unknown>;
+      if (isStale()) return;
+      const sceneData = await host.getAllSceneData(sceneAtStart) as Record<string, unknown>;
+      if (isStale()) return;
 
       // Build engine→dbId lookup for callbacks that receive engine IDs
       const idMap = new Map<string, string>();
@@ -170,10 +216,9 @@ export function SynthGeneratorPanel({
         // Fallback: read prompt from tracks table (bulk-add saves there, not plugin_data)
         if (!prompt && handle.prompt) {
           prompt = handle.prompt;
-          // Backfill into plugin_data so future loads find it directly
-          if (activeSceneId) {
-            host.setSceneData(activeSceneId, promptKey, prompt).catch(() => {});
-          }
+          // Backfill into plugin_data so future loads find it directly.
+          // Use the scene this load is for, not the (possibly changed) active scene.
+          host.setSceneData(sceneAtStart, promptKey, prompt).catch(() => {});
         }
 
         // Detect hasMidi from role presence as a fallback
@@ -210,13 +255,19 @@ export function SynthGeneratorPanel({
           instrumentMissing,
           instrumentDrawerOpen: false,
           instrumentDrawerStage: 'instruments',
+          shuffleHistory: new Set<string>(),
         });
       }
+      if (isStale()) return;
       setTracks(trackStates);
     } catch (error: unknown) {
       console.error('[SynthGeneratorPanel] Failed to load tracks:', error);
     } finally {
-      setIsLoadingTracks(false);
+      // Only clear the loading indicator if no newer loadTracks has taken
+      // over — otherwise we'd race with the newer load's own loading state.
+      if (tracksLoadedForSceneRef.current === sceneAtStart) {
+        setIsLoadingTracks(false);
+      }
     }
   }, [host, activeSceneId]);
 
@@ -267,6 +318,29 @@ export function SynthGeneratorPanel({
     });
     return unsub;
   }, [host, adoptAndLoad]);
+
+  // --- Re-adopt tracks after agent/CLI tool mutations -------------------
+  // The HTTP API path (compose_scene from the chat plugin, sas CLI calls,
+  // MCP tools) creates tracks in the DB directly via ToolRegistry, bypassing
+  // host.createTrack/host.composeScene. Without this listener the panel never
+  // sees those tracks until the user manually switches scenes — and the
+  // "compose in progress" spinner never appears for AI-driven runs.
+  // Debounced 500ms so a burst of tool calls coalesces into one reload.
+  useEffect(() => {
+    if (typeof host.onAfterAgentMutation !== 'function') return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const unsub = host.onAfterAgentMutation(() => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        loadTracks(true);
+      }, 500);
+    });
+    return () => {
+      unsub?.();
+      if (timer) clearTimeout(timer);
+    };
+  }, [host, loadTracks]);
 
   // --- Subscribe to real-time track state changes -----------------------
   useEffect(() => {
@@ -320,7 +394,17 @@ export function SynthGeneratorPanel({
   }, []);
 
   // --- Add track --------------------------------------------------------
+  // Re-entry guard: rapid clicks on "+ Add" used to race here. The button's
+  // visual `disabled` only updates after React commits the next render, so
+  // two clicks within the same tick both passed the `tracks.length` gate
+  // and both fired `host.createTrack` — producing duplicate synth-<ts>
+  // tracks (see 0.55–0.65s-apart timestamps in the audit log). The ref is
+  // synchronous (not subject to render-cycle latency); the state mirrors
+  // it so the button can disable itself visually too.
+  const isAddingTrackRef = useRef(false);
+  const [isAddingTrack, setIsAddingTrack] = useState(false);
   const handleAddTrack = useCallback(async (): Promise<void> => {
+    if (isAddingTrackRef.current) return;
     if (!activeSceneId) {
       host.showToast('warning', 'Select SCENE');
       return;
@@ -335,6 +419,8 @@ export function SynthGeneratorPanel({
     }
     if (tracks.length >= MAX_TRACKS) return;
 
+    isAddingTrackRef.current = true;
+    setIsAddingTrack(true);
     try {
       const handle = await host.createTrack({
         name: `synth-${Date.now()}`,
@@ -357,6 +443,7 @@ export function SynthGeneratorPanel({
         instrumentMissing: false,
         instrumentDrawerOpen: false,
         instrumentDrawerStage: 'instruments',
+        shuffleHistory: new Set<string>(),
       };
       setTracks(prev => [...prev, newTrack]);
       onExpandSelf?.();
@@ -370,65 +457,53 @@ export function SynthGeneratorPanel({
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
       host.showToast('error', 'Failed to create track', msg);
+    } finally {
+      isAddingTrackRef.current = false;
+      setIsAddingTrack(false);
     }
   }, [host, activeSceneId, isConnected, isAuthenticated, tracks.length, onExpandSelf]);
 
-  // --- Compose (bulk add) -----------------------------------------------
-  const handleCompose = useCallback(async (): Promise<void> => {
-    if (!activeSceneId) return;
-    const composeForScene = activeSceneId;
-    // Immediately show progress bar + disable button (don't rely on IPC events)
-    setIsComposingForScene(composeForScene, true);
-    setPlaceholdersForScene(composeForScene, []);
+  // --- Export tracks as MIDI bundle -------------------------------------
+  const [isExportingMidi, setIsExportingMidi] = useState(false);
+  const handleExportMidi = useCallback(async (): Promise<void> => {
+    if (isExportingMidi) return;
+    setIsExportingMidi(true);
     try {
-      const contractPrompt = sceneContext?.contractPrompt || '';
-      const genre = sceneContext?.genre || null;
-      await host.composeScene({ contractPrompt, genre });
-      await host.adoptSceneTracks();
-      await loadTracks();
+      const result = await host.exportTracksAsMidiBundle({
+        defaultName: 'midi-tracks',
+      });
+      if (result.success) {
+        const filename = result.filePath.split('/').pop() || result.filePath;
+        const skippedNote = result.skippedCount > 0
+          ? ` (${result.skippedCount} empty track${result.skippedCount === 1 ? '' : 's'} skipped)`
+          : '';
+        host.showToast('success', 'MIDI exported', `${result.trackCount} track${result.trackCount === 1 ? '' : 's'} → ${filename}${skippedNote}`);
+      } else if (!('canceled' in result && result.canceled)) {
+        const errMsg = 'error' in result ? result.error : 'Unknown error';
+        host.showToast('error', 'Export failed', errMsg);
+      }
     } catch (error: unknown) {
-      const msg = error instanceof Error ? error.message : 'Composition failed';
-      host.showToast('error', 'Compose failed', msg);
+      const msg = error instanceof Error ? error.message : String(error);
+      host.showToast('error', 'Export failed', msg);
     } finally {
-      // Reset composing state for THIS scene (IPC events may have already done this, but be safe)
-      setIsComposingForScene(composeForScene, false);
-      setPlaceholdersForScene(composeForScene, EMPTY_PLACEHOLDERS);
+      setIsExportingMidi(false);
     }
-  }, [host, activeSceneId, sceneContext, loadTracks, setIsComposingForScene, setPlaceholdersForScene]);
+  }, [host, isExportingMidi]);
 
-  // --- Push header content (Compose + Add buttons) to accordion header ---
+  // --- Push header content (Add button) to accordion header -------------
   const isBulkActive = !!(isComposing || placeholders.length > 0);
   const needsContract = !sceneContext?.hasContract;
   useEffect(() => {
     if (!onHeaderContent) return;
-    const addDisabled = needsContract || !isConnected || !activeSceneId || tracks.length >= MAX_TRACKS;
-    const canCompose = !!(
-      isAuthenticated &&
-      sceneContext?.hasContract &&
-      !sceneContext.hasTracks &&
-      tracks.length === 0 &&
-      !isBulkActive
-    );
-    const composeDisabled = needsContract || !canCompose || isBulkActive;
+    const addDisabled =
+      needsContract ||
+      !isConnected ||
+      !activeSceneId ||
+      tracks.length >= MAX_TRACKS ||
+      isAddingTrack;
 
     onHeaderContent(
       <div className="flex gap-1">
-        <button
-          data-testid="bulk-add-button"
-          onClick={(e: React.MouseEvent) => {
-            e.stopPropagation();
-            if (needsContract) { onOpenContract?.(); return; }
-            handleCompose();
-          }}
-          className={`px-2 py-0.5 text-[10px] uppercase tracking-wide rounded-sm border transition-colors ${
-            composeDisabled
-              ? 'text-sas-muted/50 border-sas-border/50 cursor-not-allowed'
-              : 'text-sas-muted hover:text-sas-accent border-sas-border hover:border-sas-accent'
-          }`}
-          title={needsContract ? 'Generate a contract first' : sceneContext?.hasTracks ? 'Scene already has tracks' : 'Generate a full arrangement'}
-        >
-          Compose
-        </button>
         <button
           data-testid="add-synth-track-button"
           onClick={(e: React.MouseEvent) => {
@@ -447,8 +522,8 @@ export function SynthGeneratorPanel({
       </div>
     );
     return () => { onHeaderContent(null); };
-  }, [onHeaderContent, sceneContext, isBulkActive, isConnected, needsContract,
-      activeSceneId, tracks.length, handleAddTrack, handleCompose, onOpenContract]);
+  }, [onHeaderContent, needsContract, isConnected, activeSceneId, tracks.length, isAddingTrack,
+      handleAddTrack, onOpenContract]);
 
   // --- Push loading state to accordion header ---------------------------
   useEffect(() => {
@@ -515,27 +590,29 @@ export function SynthGeneratorPanel({
       // 3. Classify preset category from the prompt
       const presetCategory = await host.classifyPresetCategory(track.prompt);
 
-      // 4. Build user prompt (musical context auto-prefixed by SDK)
-      const concurrentSummary = generationContext.concurrentTracks.length > 0
-        ? generationContext.concurrentTracks.map(
-            (ct) => `  - ${ct.role ?? 'unknown'} (${ct.presetCategory ?? 'unknown category'})`
-          ).join('\n')
-        : '  (none yet)';
+      // 4. Build user prompt (musical context + scene contract auto-prefixed by SDK).
+      // The SDK helper renders other tracks' role + prompt + raw MIDI
+      // notes-by-chord, so the LLM sees the full scene state. Empty when
+      // no other tracks exist — skip the heading rather than emit
+      // "(none yet)" noise.
+      const concurrentBlock = formatConcurrentTracks(generationContext);
 
-      const userPrompt = [
-        `Concurrent tracks already in the scene:`,
-        concurrentSummary,
-        ``,
+      const promptParts: string[] = [];
+      if (concurrentBlock) {
+        promptParts.push(concurrentBlock, '');
+      }
+      promptParts.push(
         `Classified preset category: ${presetCategory}`,
         ``,
         `User request: "${track.prompt}"`,
         ``,
         `Generate MIDI notes for a synth part that fits this context.`,
-      ].join('\n');
+      );
+      const userPrompt = promptParts.join('\n');
 
       // 5. Call LLM (SDK auto-prefixes musical context)
       const llmResult = await host.generateWithLLM({
-        system: MIDI_SYSTEM_PROMPT,
+        system: buildMidiSystemPrompt(host.getValidRoles()),
         user: userPrompt,
         responseFormat: 'json',
       });
@@ -561,11 +638,39 @@ export function SynthGeneratorPanel({
       };
       await host.writeMidiClip(trackId, clipData);
 
+      // Mute newly generated tracks by default — user explicitly asked for
+      // this so fresh generations don't blast out while the user is still
+      // setting up the next track. The M button in TrackRow reflects the
+      // state; clicking it un-mutes when the user is ready to audition.
+      // Optimistic local update so the UI doesn't wait for the
+      // trackStateChanged event to round-trip from the engine.
+      await host.setTrackMute(trackId, true).catch(() => {});
+      setTracks(prev => prev.map(t =>
+        t.handle.id === trackId
+          ? { ...t, runtimeState: { ...t.runtimeState, muted: true } }
+          : t
+      ));
+
       // Store role in scene data for shuffle/duplicate to use (stable DB UUID key)
       const genDbId = engineToDbIdRef.current.get(trackId) ?? trackId;
       const newRole = parsed.role ?? track.role;
       if (activeSceneId && newRole) {
         host.setSceneData(activeSceneId, `track:${genDbId}:role`, newRole).catch(() => {});
+      }
+
+      // Persist the role to tracks.role so the v1 transition generator's
+      // layer classifier can see it. Without this, plugin-created synth
+      // tracks ship as role=NULL, classify as harmonic_unknown, and drop
+      // out of the transition chop catalog — transitions silently omit
+      // the layer.
+      if (newRole && newRole !== track.role) {
+        try {
+          await host.setTrackRole(trackId, newRole);
+        } catch (err) {
+          // Non-fatal — MIDI is already written. A follow-up backfill or
+          // manual re-generation can populate role later.
+          console.warn('[SynthGeneratorPanel] setTrackRole failed:', err);
+        }
       }
 
       // Apply a matching preset based on the role + MIDI notes
@@ -640,15 +745,44 @@ export function SynthGeneratorPanel({
   }, [host]);
 
   // --- Shuffle preset (keep MIDI, new sound) ----------------------------
+  // Cycle pattern: each track maintains a shuffleHistory Set of preset
+  // names already tried. We hand it to host.shufflePreset as excludeNames;
+  // when the category pool is exhausted the host throws "No presets
+  // available", we wipe the history and retry. After a successful pick
+  // the returned preset name is added to the (possibly fresh) history.
   const handleShuffle = useCallback(async (trackId: string): Promise<void> => {
+    const track = tracks.find(t => t.handle.id === trackId);
+    if (!track) return;
     try {
-      const result = await host.shufflePreset(trackId);
-      console.log(`[SynthGenerator] Preset shuffled: ${result.presetName}`);
+      let result;
+      let nextHistory: Set<string>;
+      try {
+        result = await host.shufflePreset(trackId, Array.from(track.shuffleHistory));
+        nextHistory = new Set(track.shuffleHistory);
+      } catch (firstErr: unknown) {
+        // Distinguish "exhausted" (expected, retry with fresh deck) from
+        // other failures (Surge missing, network, etc — surface to user).
+        const msg = firstErr instanceof Error ? firstErr.message : String(firstErr);
+        if (/no presets available/i.test(msg)) {
+          // Cycle complete — reset history and try again with empty exclude.
+          nextHistory = new Set<string>();
+          result = await host.shufflePreset(trackId, []);
+        } else {
+          throw firstErr;
+        }
+      }
+      nextHistory.add(result.presetName);
+      setTracks(prev => prev.map(t =>
+        t.handle.id === trackId ? { ...t, shuffleHistory: nextHistory } : t
+      ));
+      console.log(
+        `[SynthGenerator] Preset shuffled: ${result.presetName} (history ${nextHistory.size})`
+      );
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Shuffle failed';
       host.showToast('error', 'Shuffle failed', msg);
     }
-  }, [host]);
+  }, [host, tracks]);
 
   // --- Duplicate track (copy MIDI, new preset) --------------------------
   const handleCopy = useCallback(async (trackId: string): Promise<void> => {
@@ -1011,6 +1145,35 @@ export function SynthGeneratorPanel({
           />
         ))
       )}
+
+      {/* Export Tracks — bundle all synth tracks' MIDI as a ZIP */}
+      {!isLoadingTracks && tracks.length > 0 && (() => {
+        const hasAnyMidi = tracks.some(t => t.hasMidi);
+        const exportDisabled = isExportingMidi || !hasAnyMidi;
+        return (
+          <div className="pt-2">
+            <button
+              data-testid="export-midi-tracks-button"
+              onClick={handleExportMidi}
+              disabled={exportDisabled}
+              title={
+                isExportingMidi
+                  ? 'Exporting...'
+                  : !hasAnyMidi
+                    ? 'Generate MIDI on at least one track first'
+                    : 'Export all tracks as a ZIP of .mid files'
+              }
+              className={`w-full px-2 py-1.5 text-[10px] uppercase tracking-wide rounded-sm border transition-colors ${
+                exportDisabled
+                  ? 'text-sas-muted/40 border-transparent hover:border-sas-accent cursor-not-allowed'
+                  : 'text-sas-muted hover:text-sas-accent border-sas-border hover:border-sas-accent'
+              }`}
+            >
+              {isExportingMidi ? 'Exporting...' : 'Export Tracks'}
+            </button>
+          </div>
+        );
+      })()}
     </div>
   );
 }

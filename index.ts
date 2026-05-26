@@ -1,9 +1,13 @@
 /**
- * @signalsandsorcery/synth-generator — Built-in Synth Generator Plugin
+ * @signalsandsorcery/synth-generator — Synth Generator Plugin
  *
  * AI-powered MIDI generation with Surge XT synthesis.
  * Supports single and bulk track generation, preset management,
  * and orphaned track detection.
+ *
+ * Extracted from the in-tree built-in (W9). The host consumes this package
+ * via `file:../sas-synth-plugin` and registers it exactly like the chat
+ * plugin — importing both the class and the manifest from the package root.
  */
 
 import type { ComponentType } from 'react';
@@ -15,6 +19,10 @@ import type {
   MusicalContext,
 } from '@signalsandsorcery/plugin-sdk';
 import { SynthGeneratorPanel } from './SynthGeneratorPanel';
+import synthManifest from './plugin.json';
+
+/** Plugin manifest (re-exported so the host registers it from the package root). */
+export { synthManifest };
 
 export class SynthGeneratorPlugin implements GeneratorPlugin {
   readonly id = '@signalsandsorcery/synth-generator';
