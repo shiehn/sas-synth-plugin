@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, useSceneState, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, useSceneState, useSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
 
 // ============================================================================
 // Constants
@@ -115,6 +115,7 @@ export function SynthGeneratorPanel({
 }: PluginUIProps): React.ReactElement {
   const [tracks, setTracks] = useState<SynthTrackState[]>([]);
   const [isLoadingTracks, setIsLoadingTracks] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   // Scene-keyed compose state: preserved when switching scenes via SDK hook
   const [isComposing, , setIsComposingForScene] = useSceneState(activeSceneId, false);
   const [placeholders, , setPlaceholdersForScene] = useSceneState<BulkAddPlaceholderTrack[]>(activeSceneId, EMPTY_PLACEHOLDERS);
@@ -132,6 +133,37 @@ export function SynthGeneratorPanel({
   // NEW scene's header — a "ghost track" symptom that goes away on re-mount.
   // Clear on real scene transitions so the gap is empty, not stale.
   const tracksLoadedForSceneRef = useRef<string | null>(null);
+
+  // --- Sound history (↩ back-arrow + drawer "History" tab) --------------
+  // A synth "sound" is its Surge XT plugin state (base64): snapshot via
+  // getPluginState at the Surge plugin's index, restore via setPluginState.
+  const getSurgeIndex = useCallback(async (trackId: string): Promise<number | null> => {
+    try {
+      const plugins = await host.getTrackPlugins(trackId);
+      const surge = plugins.find((p) => p.name.includes('Surge'));
+      return surge ? surge.index : null;
+    } catch {
+      return null;
+    }
+  }, [host]);
+  const applySynthSound = useCallback(async (trackId: string, descriptor: unknown): Promise<void> => {
+    const { state } = descriptor as { state: string };
+    const idx = await getSurgeIndex(trackId);
+    if (idx == null) return;
+    await host.setPluginState(trackId, idx, state);
+  }, [host, getSurgeIndex]);
+  const soundHistory = useSoundHistory(applySynthSound);
+  const captureSynthSound = useCallback(async (trackId: string, label: string): Promise<void> => {
+    const idx = await getSurgeIndex(trackId);
+    if (idx == null) return;
+    try {
+      const state = await host.getPluginState(trackId, idx);
+      soundHistory.record(trackId, { state }, label);
+    } catch {
+      // Non-fatal — history just won't include this sound.
+    }
+  }, [host, getSurgeIndex, soundHistory]);
+
   const loadTracks = useCallback(async (incremental = false): Promise<void> => {
     // Snapshot the scene this load is for. Each subsequent await is a chance
     // for `activeSceneId` to change (user switches scene mid-load) or for a
@@ -154,6 +186,8 @@ export function SynthGeneratorPanel({
       setTracks([]);
     }
     tracksLoadedForSceneRef.current = sceneAtStart;
+    // Reset sound-history on a full (re)load so history resets per scene/reopen.
+    if (!incremental) soundHistory.reset();
 
     const isStale = (): boolean => tracksLoadedForSceneRef.current !== sceneAtStart;
 
@@ -269,7 +303,7 @@ export function SynthGeneratorPanel({
         setIsLoadingTracks(false);
       }
     }
-  }, [host, activeSceneId]);
+  }, [host, activeSceneId, soundHistory]);
 
   useEffect(() => {
     loadTracks();
@@ -504,6 +538,24 @@ export function SynthGeneratorPanel({
 
     onHeaderContent(
       <div className="flex gap-1">
+        {host.listImportableTracks && (
+          <button
+            data-testid="import-from-scene-synth-button"
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              onExpandSelf?.();
+              setImportOpen(true);
+            }}
+            disabled={!activeSceneId || needsContract}
+            className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
+              !activeSceneId || needsContract
+                ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
+                : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
+            }`}
+          >
+            Import
+          </button>
+        )}
         <button
           data-testid="add-synth-track-button"
           onClick={(e: React.MouseEvent) => {
@@ -523,7 +575,7 @@ export function SynthGeneratorPanel({
     );
     return () => { onHeaderContent(null); };
   }, [onHeaderContent, needsContract, isConnected, activeSceneId, tracks.length, isAddingTrack,
-      handleAddTrack, onOpenContract]);
+      handleAddTrack, onOpenContract, host, onExpandSelf]);
 
   // --- Push loading state to accordion header ---------------------------
   useEffect(() => {
@@ -690,6 +742,8 @@ export function SynthGeneratorPanel({
           ? { ...t, isGenerating: false, error: null, role: newRole, hasMidi: true, generationProgress: 0 }
           : t
       ));
+      // Fresh baseline — clear history; the next shuffle lazy-seeds this preset.
+      soundHistory.clear(trackId);
       host.showToast('success', 'MIDI generated');
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Generation failed';
@@ -698,7 +752,7 @@ export function SynthGeneratorPanel({
       ));
       host.showToast('error', 'Generation failed', msg);
     }
-  }, [host, tracks, isAuthenticated, activeSceneId]);
+  }, [host, tracks, isAuthenticated, activeSceneId, soundHistory]);
 
   // --- Mute/Solo/Volume/Pan -----------------------------------------------
   const handleMuteToggle = useCallback((trackId: string): void => {
@@ -753,6 +807,11 @@ export function SynthGeneratorPanel({
   const handleShuffle = useCallback(async (trackId: string): Promise<void> => {
     const track = tracks.find(t => t.handle.id === trackId);
     if (!track) return;
+    // Lazy-seed: capture the pre-shuffle preset on the first shuffle so undo
+    // can return to it (cheaper than a getPluginState sweep on scene load).
+    if (soundHistory.list(trackId).entries.length === 0) {
+      await captureSynthSound(trackId, 'Previous preset');
+    }
     try {
       let result;
       let nextHistory: Set<string>;
@@ -775,6 +834,8 @@ export function SynthGeneratorPanel({
       setTracks(prev => prev.map(t =>
         t.handle.id === trackId ? { ...t, shuffleHistory: nextHistory } : t
       ));
+      // Record the new preset so the ↩ back-arrow + History tab can return to it.
+      await captureSynthSound(trackId, result.presetName);
       console.log(
         `[SynthGenerator] Preset shuffled: ${result.presetName} (history ${nextHistory.size})`
       );
@@ -782,7 +843,7 @@ export function SynthGeneratorPanel({
       const msg = error instanceof Error ? error.message : 'Shuffle failed';
       host.showToast('error', 'Shuffle failed', msg);
     }
-  }, [host, tracks]);
+  }, [host, tracks, soundHistory, captureSynthSound]);
 
   // --- Duplicate track (copy MIDI, new preset) --------------------------
   const handleCopy = useCallback(async (trackId: string): Promise<void> => {
@@ -1069,6 +1130,11 @@ export function SynthGeneratorPanel({
                 instrumentDrawerStage={loadedTrack.instrumentDrawerStage}
                 onShowEditor={() => handleShowEditor(loadedTrack.handle.id)}
                 onBackToInstruments={() => handleBackToInstruments(loadedTrack.handle.id)}
+                onUndoShuffle={() => { void soundHistory.undo(loadedTrack.handle.id); }}
+                canUndoShuffle={soundHistory.canUndo(loadedTrack.handle.id)}
+                soundHistory={soundHistory.list(loadedTrack.handle.id).entries}
+                soundHistoryCursor={soundHistory.list(loadedTrack.handle.id).cursor}
+                onRestoreSound={(i: number) => { void soundHistory.restoreTo(loadedTrack.handle.id, i); }}
               />
             );
           }
@@ -1093,6 +1159,15 @@ export function SynthGeneratorPanel({
   // Phase 3: NORMAL — real tracks using SDK TrackRow
   return (
     <div data-testid="synth-section" className="p-2 space-y-2">
+      {host.listImportableTracks && (
+        <ImportTrackModal
+          host={host}
+          open={importOpen}
+          onClose={() => setImportOpen(false)}
+          onImported={() => { void loadTracks(true); }}
+          testIdPrefix="synth-import"
+        />
+      )}
       {isLoadingTracks ? (
         <div className="text-sas-muted text-xs text-center py-4">Loading tracks...</div>
       ) : (
@@ -1142,6 +1217,11 @@ export function SynthGeneratorPanel({
             instrumentDrawerStage={track.instrumentDrawerStage}
             onShowEditor={() => handleShowEditor(track.handle.id)}
             onBackToInstruments={() => handleBackToInstruments(track.handle.id)}
+            onUndoShuffle={() => { void soundHistory.undo(track.handle.id); }}
+            canUndoShuffle={soundHistory.canUndo(track.handle.id)}
+            soundHistory={soundHistory.list(track.handle.id).entries}
+            soundHistoryCursor={soundHistory.list(track.handle.id).cursor}
+            onRestoreSound={(i: number) => { void soundHistory.restoreTo(track.handle.id, i); }}
           />
         ))
       )}
