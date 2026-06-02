@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, useSceneState, useSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, useSceneState, useSoundHistory, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
 
 // ============================================================================
 // Constants
@@ -152,7 +152,17 @@ export function SynthGeneratorPanel({
     if (idx == null) return;
     await host.setPluginState(trackId, idx, state);
   }, [host, getSurgeIndex]);
-  const soundHistory = useSoundHistory(applySynthSound);
+  // Persist per-track history to project scene-data so it survives reopen.
+  // Surge state blobs are large, so cap synth history tighter than samples.
+  const persistSoundHistory = useCallback(
+    (trackId: string, state: TrackSoundHistory): void => {
+      if (!activeSceneId) return;
+      const dbId = engineToDbIdRef.current.get(trackId) ?? trackId;
+      host.setSceneData(activeSceneId, `track:${dbId}:soundHistory`, state).catch(() => {});
+    },
+    [host, activeSceneId],
+  );
+  const soundHistory = useSoundHistory(applySynthSound, { max: 12, onChange: persistSoundHistory });
   const captureSynthSound = useCallback(async (trackId: string, label: string): Promise<void> => {
     const idx = await getSurgeIndex(trackId);
     if (idx == null) return;
@@ -175,6 +185,12 @@ export function SynthGeneratorPanel({
     if (!sceneAtStart) {
       setTracks([]);
       tracksLoadedForSceneRef.current = null;
+      // No scene → nothing to load → not loading. Without this, a load that
+      // had already set isLoadingTracks=true (line below) and is then
+      // superseded by a flip to a null activeSceneId (the platform's
+      // effectiveSceneId briefly returns null while project.scenes repopulates
+      // during load) leaves the spinner stuck on "Loading tracks..." forever.
+      setIsLoadingTracks(false);
       return;
     }
 
@@ -294,6 +310,14 @@ export function SynthGeneratorPanel({
       }
       if (isStale()) return;
       setTracks(trackStates);
+      // Restore persisted history so it survives reopen. Lazy-seed (first shuffle)
+      // still covers tracks with no saved history.
+      for (const ts of trackStates) {
+        const persisted = sceneData[`track:${ts.handle.dbId}:soundHistory`];
+        if (persisted && typeof persisted === 'object') {
+          soundHistory.restore(ts.handle.id, persisted as TrackSoundHistory);
+        }
+      }
     } catch (error: unknown) {
       console.error('[SynthGeneratorPanel] Failed to load tracks:', error);
     } finally {
@@ -575,7 +599,7 @@ export function SynthGeneratorPanel({
     );
     return () => { onHeaderContent(null); };
   }, [onHeaderContent, needsContract, isConnected, activeSceneId, tracks.length, isAddingTrack,
-      handleAddTrack, onOpenContract, host, onExpandSelf]);
+      handleAddTrack, onOpenContract, host]);
 
   // --- Push loading state to accordion header ---------------------------
   useEffect(() => {
@@ -1130,11 +1154,10 @@ export function SynthGeneratorPanel({
                 instrumentDrawerStage={loadedTrack.instrumentDrawerStage}
                 onShowEditor={() => handleShowEditor(loadedTrack.handle.id)}
                 onBackToInstruments={() => handleBackToInstruments(loadedTrack.handle.id)}
-                onUndoShuffle={() => { void soundHistory.undo(loadedTrack.handle.id); }}
-                canUndoShuffle={soundHistory.canUndo(loadedTrack.handle.id)}
                 soundHistory={soundHistory.list(loadedTrack.handle.id).entries}
                 soundHistoryCursor={soundHistory.list(loadedTrack.handle.id).cursor}
                 onRestoreSound={(i: number) => { void soundHistory.restoreTo(loadedTrack.handle.id, i); }}
+                onToggleFavorite={(i: number) => soundHistory.toggleFavorite(loadedTrack.handle.id, i)}
               />
             );
           }
@@ -1217,11 +1240,10 @@ export function SynthGeneratorPanel({
             instrumentDrawerStage={track.instrumentDrawerStage}
             onShowEditor={() => handleShowEditor(track.handle.id)}
             onBackToInstruments={() => handleBackToInstruments(track.handle.id)}
-            onUndoShuffle={() => { void soundHistory.undo(track.handle.id); }}
-            canUndoShuffle={soundHistory.canUndo(track.handle.id)}
             soundHistory={soundHistory.list(track.handle.id).entries}
             soundHistoryCursor={soundHistory.list(track.handle.id).cursor}
             onRestoreSound={(i: number) => { void soundHistory.restoreTo(track.handle.id, i); }}
+            onToggleFavorite={(i: number) => soundHistory.toggleFavorite(track.handle.id, i)}
           />
         ))
       )}
