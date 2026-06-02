@@ -116,6 +116,7 @@ export function SynthGeneratorPanel({
   const [tracks, setTracks] = useState<SynthTrackState[]>([]);
   const [isLoadingTracks, setIsLoadingTracks] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [soundImportTarget, setSoundImportTarget] = useState<SynthTrackState | null>(null);
   // Scene-keyed compose state: preserved when switching scenes via SDK hook
   const [isComposing, , setIsComposingForScene] = useSceneState(activeSceneId, false);
   const [placeholders, , setPlaceholdersForScene] = useSceneState<BulkAddPlaceholderTrack[]>(activeSceneId, EMPTY_PLACEHOLDERS);
@@ -163,6 +164,32 @@ export function SynthGeneratorPanel({
     [host, activeSceneId],
   );
   const soundHistory = useSoundHistory(applySynthSound, { max: 12, onChange: persistSoundHistory });
+
+  // Import just the PRESET (Surge state) from a track in another scene (drawer
+  // "Import Preset"), bypassing the contract gate — "different contract, same
+  // preset". Read the source state via host.getTrackSound, then apply + record.
+  const handleSoundImportPick = useCallback(
+    async (sel: { sourceTrackDbId: string; trackName: string; sceneName: string }): Promise<void> => {
+      const target = soundImportTarget;
+      if (!target || !host.getTrackSound) { setSoundImportTarget(null); return; }
+      try {
+        const snap = await host.getTrackSound(sel.sourceTrackDbId);
+        if (!snap || snap.kind !== 'preset') {
+          host.showToast('error', 'No preset to import', `${sel.trackName} has no synth preset.`);
+          return;
+        }
+        const descriptor = { state: snap.state };
+        await applySynthSound(target.handle.id, descriptor);
+        soundHistory.record(target.handle.id, descriptor, snap.label);
+        host.showToast('success', 'Preset imported', `${snap.label} → ${target.handle.name}`);
+      } catch (err: unknown) {
+        host.showToast('error', 'Import failed', err instanceof Error ? err.message : String(err));
+      } finally {
+        setSoundImportTarget(null);
+      }
+    },
+    [soundImportTarget, host, applySynthSound, soundHistory],
+  );
   const captureSynthSound = useCallback(async (trackId: string, label: string): Promise<void> => {
     const idx = await getSurgeIndex(trackId);
     if (idx == null) return;
@@ -577,7 +604,7 @@ export function SynthGeneratorPanel({
                 : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
             }`}
           >
-            Import
+            Import Track
           </button>
         )}
         <button
@@ -593,7 +620,7 @@ export function SynthGeneratorPanel({
               : 'bg-sas-accent/10 border-sas-accent/30 text-sas-accent hover:bg-sas-accent/20'
           }`}
         >
-          + Add
+          Add Track
         </button>
       </div>
     );
@@ -1158,6 +1185,8 @@ export function SynthGeneratorPanel({
                 soundHistoryCursor={soundHistory.list(loadedTrack.handle.id).cursor}
                 onRestoreSound={(i: number) => { void soundHistory.restoreTo(loadedTrack.handle.id, i); }}
                 onToggleFavorite={(i: number) => soundHistory.toggleFavorite(loadedTrack.handle.id, i)}
+                onImportSound={() => setSoundImportTarget(loadedTrack)}
+                importSoundLabel="Import Preset"
               />
             );
           }
@@ -1189,6 +1218,18 @@ export function SynthGeneratorPanel({
           onClose={() => setImportOpen(false)}
           onImported={() => { void loadTracks(true); }}
           testIdPrefix="synth-import"
+        />
+      )}
+      {host.listImportableTracks && host.getTrackSound && (
+        <ImportTrackModal
+          host={host}
+          mode="sound"
+          open={!!soundImportTarget}
+          title="Import Preset"
+          onClose={() => setSoundImportTarget(null)}
+          onImported={() => {}}
+          onPick={handleSoundImportPick}
+          testIdPrefix="synth-sound-import"
         />
       )}
       {isLoadingTracks ? (
@@ -1244,6 +1285,8 @@ export function SynthGeneratorPanel({
             soundHistoryCursor={soundHistory.list(track.handle.id).cursor}
             onRestoreSound={(i: number) => { void soundHistory.restoreTo(track.handle.id, i); }}
             onToggleFavorite={(i: number) => soundHistory.toggleFavorite(track.handle.id, i)}
+            onImportSound={() => setSoundImportTarget(track)}
+            importSoundLabel="Import Preset"
           />
         ))
       )}
