@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, useSceneState, useSoundHistory, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useSceneState, useSoundHistory, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
 
 // ============================================================================
 // Constants
@@ -70,7 +70,10 @@ interface SynthTrackState {
   role: string;
   runtimeState: PluginTrackRuntimeState;
   fxDetailState: TrackFxDetailState;
-  fxDrawerOpen: boolean;
+  // Unified drawer state (replaces fxDrawerOpen + instrumentDrawerOpen + instrumentDrawerStage).
+  drawerOpen: boolean;
+  drawerTab: DrawerTab;
+  editorStage: boolean;
   isGenerating: boolean;
   error: string | null;
   hasMidi: boolean;
@@ -78,8 +81,6 @@ interface SynthTrackState {
   instrumentPluginId: string | null;
   instrumentName: string | null;
   instrumentMissing: boolean;
-  instrumentDrawerOpen: boolean;
-  instrumentDrawerStage: 'instruments' | 'editor';
   /**
    * Per-track shuffle history. Set of Surge XT preset names already
    * handed back since the track was created OR since the history was
@@ -322,7 +323,9 @@ export function SynthGeneratorPanel({
           role: handle.role ?? '',
           runtimeState,
           fxDetailState,
-          fxDrawerOpen: false,
+          drawerOpen: false,
+          drawerTab: 'fx',
+          editorStage: false,
           isGenerating: false,
           error: null,
           hasMidi,
@@ -330,8 +333,6 @@ export function SynthGeneratorPanel({
           instrumentPluginId: handle.instrumentPluginId ?? null,
           instrumentName: handle.instrumentName ?? null,
           instrumentMissing,
-          instrumentDrawerOpen: false,
-          instrumentDrawerStage: 'instruments',
           shuffleHistory: new Set<string>(),
         });
       }
@@ -518,7 +519,9 @@ export function SynthGeneratorPanel({
         role: '',
         runtimeState: { id: handle.id, muted: false, solo: false, volume: 0.75, pan: 0 },
         fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
-        fxDrawerOpen: false,
+        drawerOpen: false,
+        drawerTab: 'fx',
+        editorStage: false,
         isGenerating: false,
         error: null,
         hasMidi: false,
@@ -526,8 +529,6 @@ export function SynthGeneratorPanel({
         instrumentPluginId: null,
         instrumentName: null,
         instrumentMissing: false,
-        instrumentDrawerOpen: false,
-        instrumentDrawerStage: 'instruments',
         shuffleHistory: new Set<string>(),
       };
       setTracks(prev => [...prev, newTrack]);
@@ -952,12 +953,15 @@ export function SynthGeneratorPanel({
   }, [host]);
 
   const toggleFxDrawer = useCallback((trackId: string): void => {
-    setTracks(prev => prev.map(t =>
-      t.handle.id === trackId ? { ...t, fxDrawerOpen: !t.fxDrawerOpen, instrumentDrawerOpen: false, instrumentDrawerStage: 'instruments' as const } : t
-    ));
-    // Refresh FX state when opening drawer
+    setTracks(prev => prev.map(t => {
+      if (t.handle.id !== trackId) return t;
+      const onFx = t.drawerOpen && t.drawerTab === 'fx';
+      return { ...t, drawerOpen: !onFx, drawerTab: 'fx', editorStage: false };
+    }));
+    // Refresh FX state from the engine whenever we OPEN the FX tab.
     const track = tracks.find(t => t.handle.id === trackId);
-    if (track && !track.fxDrawerOpen) {
+    const wasOnFx = !!track && track.drawerOpen && track.drawerTab === 'fx';
+    if (track && !wasOnFx) {
       host.getTrackFxState(trackId).then(fxState => {
         setTracks(prev => prev.map(t =>
           t.handle.id === trackId ? { ...t, fxDetailState: pluginFxToToggleFx(fxState) } : t
@@ -966,25 +970,20 @@ export function SynthGeneratorPanel({
     }
   }, [host, tracks]);
 
-  // --- Progress persistence callback ------------------------------------
-  const handleProgressChange = useCallback((trackId: string, pct: number): void => {
+  // Tab-strip clicks: switch the active tab, keeping the drawer open. Refresh
+  // FX state when entering FX; lazy-load instruments when entering Pick.
+  const handleTabChange = useCallback((trackId: string, tab: DrawerTab): void => {
     setTracks(prev => prev.map(t =>
-      t.handle.id === trackId ? { ...t, generationProgress: pct } : t
+      t.handle.id === trackId ? { ...t, drawerOpen: true, drawerTab: tab } : t
     ));
-  }, []);
-
-  // --- Instrument selection callbacks ------------------------------------
-  const toggleInstrumentDrawer = useCallback((trackId: string): void => {
-    // Close FX drawer when opening instrument drawer.
-    // If track has a custom instrument, open to editor stage; otherwise instrument list.
-    setTracks(prev => prev.map((t: SynthTrackState) => {
-      if (t.handle.id !== trackId) return t;
-      const opening = !t.instrumentDrawerOpen;
-      const stage = opening && t.instrumentPluginId ? 'editor' as const : 'instruments' as const;
-      return { ...t, instrumentDrawerOpen: opening, fxDrawerOpen: false, instrumentDrawerStage: stage };
-    }));
-    // Lazy-load available instruments on first drawer open
-    if (availableInstruments.length === 0 && !instrumentsLoading) {
+    if (tab === 'fx') {
+      host.getTrackFxState(trackId).then(fxState => {
+        setTracks(prev => prev.map(t =>
+          t.handle.id === trackId ? { ...t, fxDetailState: pluginFxToToggleFx(fxState) } : t
+        ));
+      }).catch(() => {});
+    } else if (tab === 'pick' && availableInstruments.length === 0 && !instrumentsLoading) {
+      // Lazy-load available instruments the first time the Pick tab is opened.
       setInstrumentsLoading(true);
       host.getAvailableInstruments().then((instruments: InstrumentDescriptor[]) => {
         setAvailableInstruments(instruments);
@@ -994,13 +993,31 @@ export function SynthGeneratorPanel({
     }
   }, [host, availableInstruments.length, instrumentsLoading]);
 
+  // --- Progress persistence callback ------------------------------------
+  const handleProgressChange = useCallback((trackId: string, pct: number): void => {
+    setTracks(prev => prev.map(t =>
+      t.handle.id === trackId ? { ...t, generationProgress: pct } : t
+    ));
+  }, []);
+
+  // --- Instrument selection callbacks ------------------------------------
+  // The ▾ button opens the unified drawer to a non-FX tab (History by default;
+  // the user reaches Pick / the plugin editor via the tab strip), or closes it.
+  const handleToggleDrawer = useCallback((trackId: string): void => {
+    setTracks(prev => prev.map((t: SynthTrackState) => {
+      if (t.handle.id !== trackId) return t;
+      const onSound = t.drawerOpen && t.drawerTab !== 'fx';
+      return { ...t, drawerOpen: !onSound, drawerTab: 'history', editorStage: false };
+    }));
+  }, []);
+
   const handleInstrumentSelect = useCallback(async (trackId: string, pluginId: string): Promise<void> => {
     const isSurgeXt = pluginId === 'Surge XT';
 
     if (isSurgeXt) {
       // Revert to default — close drawer
       setTracks(prev => prev.map((t: SynthTrackState) =>
-        t.handle.id === trackId ? { ...t, instrumentDrawerOpen: false, instrumentDrawerStage: 'instruments' as const } : t
+        t.handle.id === trackId ? { ...t, drawerOpen: false, editorStage: false } : t
       ));
       try {
         await host.setTrackInstrument(trackId, pluginId);
@@ -1022,9 +1039,9 @@ export function SynthGeneratorPanel({
       return;
     }
 
-    // Custom instrument — load it, then transition to preset stage
+    // Custom instrument — load it, then transition to the editor stage of the Pick tab
     setTracks(prev => prev.map((t: SynthTrackState) =>
-      t.handle.id === trackId ? { ...t, instrumentDrawerStage: 'editor' as const } : t
+      t.handle.id === trackId ? { ...t, drawerTab: 'pick', editorStage: true } : t
     ));
 
     try {
@@ -1045,9 +1062,9 @@ export function SynthGeneratorPanel({
       const msg = err instanceof Error ? err.message : 'Failed to load instrument';
       console.error('[SynthGeneratorPanel] Failed to set instrument:', err);
       host.showToast('error', 'Instrument load failed', msg);
-      // Revert to instrument stage on failure
+      // Revert to the instrument grid on failure
       setTracks(prev => prev.map((t: SynthTrackState) =>
-        t.handle.id === trackId ? { ...t, instrumentDrawerStage: 'instruments' as const } : t
+        t.handle.id === trackId ? { ...t, editorStage: false } : t
       ));
     }
   }, [host]);
@@ -1063,7 +1080,7 @@ export function SynthGeneratorPanel({
 
   const handleBackToInstruments = useCallback((trackId: string): void => {
     setTracks(prev => prev.map((t: SynthTrackState) =>
-      t.handle.id === trackId ? { ...t, instrumentDrawerStage: 'instruments' as const } : t
+      t.handle.id === trackId ? { ...t, editorStage: false } : t
     ));
   }, []);
 
@@ -1147,7 +1164,9 @@ export function SynthGeneratorPanel({
                   pan: loadedTrack.runtimeState.pan,
                 }}
                 fxDetailState={loadedTrack.fxDetailState}
-                fxDrawerOpen={loadedTrack.fxDrawerOpen}
+                drawerOpen={loadedTrack.drawerOpen}
+                drawerTab={loadedTrack.drawerTab}
+                onTabChange={(tab) => handleTabChange(loadedTrack.handle.id, tab)}
                 isGenerating={loadedTrack.isGenerating}
                 isAuthenticated={isAuthenticated}
                 error={loadedTrack.error}
@@ -1171,14 +1190,13 @@ export function SynthGeneratorPanel({
                 accentColor="#A78BFA"
                 instrumentName={loadedTrack.instrumentName}
                 instrumentMissing={loadedTrack.instrumentMissing}
-                instrumentDrawerOpen={loadedTrack.instrumentDrawerOpen}
-                onToggleInstrumentDrawer={() => toggleInstrumentDrawer(loadedTrack.handle.id)}
+                onToggleDrawer={() => handleToggleDrawer(loadedTrack.handle.id)}
                 availableInstruments={availableInstruments}
                 currentInstrumentPluginId={loadedTrack.instrumentPluginId}
                 onInstrumentSelect={(pluginId: string) => handleInstrumentSelect(loadedTrack.handle.id, pluginId)}
                 instrumentsLoading={instrumentsLoading}
                 onRefreshInstruments={handleRefreshInstruments}
-                instrumentDrawerStage={loadedTrack.instrumentDrawerStage}
+                editorStage={loadedTrack.editorStage}
                 onShowEditor={() => handleShowEditor(loadedTrack.handle.id)}
                 onBackToInstruments={() => handleBackToInstruments(loadedTrack.handle.id)}
                 soundHistory={soundHistory.list(loadedTrack.handle.id).entries}
@@ -1247,7 +1265,9 @@ export function SynthGeneratorPanel({
               pan: track.runtimeState.pan,
             }}
             fxDetailState={track.fxDetailState}
-            fxDrawerOpen={track.fxDrawerOpen}
+            drawerOpen={track.drawerOpen}
+            drawerTab={track.drawerTab}
+            onTabChange={(tab) => handleTabChange(track.handle.id, tab)}
             isGenerating={track.isGenerating}
             isAuthenticated={isAuthenticated}
             error={track.error}
@@ -1271,14 +1291,13 @@ export function SynthGeneratorPanel({
             accentColor="#A78BFA"
             instrumentName={track.instrumentName}
             instrumentMissing={track.instrumentMissing}
-            instrumentDrawerOpen={track.instrumentDrawerOpen}
-            onToggleInstrumentDrawer={() => toggleInstrumentDrawer(track.handle.id)}
+            onToggleDrawer={() => handleToggleDrawer(track.handle.id)}
             availableInstruments={availableInstruments}
             currentInstrumentPluginId={track.instrumentPluginId}
             onInstrumentSelect={(pluginId: string) => handleInstrumentSelect(track.handle.id, pluginId)}
             instrumentsLoading={instrumentsLoading}
             onRefreshInstruments={handleRefreshInstruments}
-            instrumentDrawerStage={track.instrumentDrawerStage}
+            editorStage={track.editorStage}
             onShowEditor={() => handleShowEditor(track.handle.id)}
             onBackToInstruments={() => handleBackToInstruments(track.handle.id)}
             soundHistory={soundHistory.list(track.handle.id).entries}
