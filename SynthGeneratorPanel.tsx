@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useSceneState, useSoundHistory, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useSceneState, useSoundHistory, useTrackReorder, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
 
 // ============================================================================
 // Constants
@@ -78,6 +78,13 @@ interface SynthTrackState {
   error: string | null;
   hasMidi: boolean;
   generationProgress: number;
+  // Piano-roll edit state. `editNotes` is the live, editable copy of the
+  // track's MIDI (loaded lazily when the Edit tab is first opened, or seeded
+  // from a fresh generation). `editBars`/`editBpm` size the grid + the save
+  // span. See loadEditNotes / handleNotesChange.
+  editNotes: PluginMidiNote[];
+  editBars: number;
+  editBpm: number;
   instrumentPluginId: string | null;
   instrumentName: string | null;
   instrumentMissing: boolean;
@@ -122,6 +129,11 @@ export function SynthGeneratorPanel({
   const [isComposing, , setIsComposingForScene] = useSceneState(activeSceneId, false);
   const [placeholders, , setPlaceholdersForScene] = useSceneState<BulkAddPlaceholderTrack[]>(activeSceneId, EMPTY_PLACEHOLDERS);
   const saveTimeoutRefs = useRef<Record<string, NodeJS.Timeout>>({});
+  // Tracks whose piano-roll notes have already been loaded (or seeded from a
+  // fresh generation). Guards the Edit tab against re-fetching on every open
+  // and against clobbering unsaved edits. A ref (not state) so toggling it
+  // never triggers a re-render / load loop.
+  const editLoadStartedRef = useRef<Set<string>>(new Set());
   const [availableInstruments, setAvailableInstruments] = useState<InstrumentDescriptor[]>([]);
   const [instrumentsLoading, setInstrumentsLoading] = useState(false);
   /** Maps engine track ID → stable DB UUID for plugin_data key construction */
@@ -165,6 +177,16 @@ export function SynthGeneratorPanel({
     [host, activeSceneId],
   );
   const soundHistory = useSoundHistory(applySynthSound, { max: 12, onChange: persistSoundHistory });
+
+  // Drag-to-reorder rows. Shared SDK hook (identical wiring in every panel):
+  // optimistic local reorder + persist via host.reorderTracks. Persist by the
+  // stable dbId so the order survives project reopen.
+  const reorder = useTrackReorder<SynthTrackState>({
+    host,
+    items: tracks,
+    setItems: setTracks,
+    getId: (t) => t.handle.dbId,
+  });
 
   // Import just the PRESET (Surge state) from a track in another scene (drawer
   // "Import Preset"), bypassing the contract gate — "different contract, same
@@ -330,6 +352,9 @@ export function SynthGeneratorPanel({
           error: null,
           hasMidi,
           generationProgress: 0,
+          editNotes: [],
+          editBars: 4,
+          editBpm: 120,
           instrumentPluginId: handle.instrumentPluginId ?? null,
           instrumentName: handle.instrumentName ?? null,
           instrumentMissing,
@@ -526,6 +551,9 @@ export function SynthGeneratorPanel({
         error: null,
         hasMidi: false,
         generationProgress: 0,
+        editNotes: [],
+        editBars: 4,
+        editBpm: 120,
         instrumentPluginId: null,
         instrumentName: null,
         instrumentMissing: false,
@@ -788,12 +816,25 @@ export function SynthGeneratorPanel({
         }
       }
 
-      // Update state on success
+      // Update state on success. Seed the piano-roll edit buffer with the
+      // freshly generated notes so opening the Edit tab needs no round-trip,
+      // and mark the track loaded so the tab doesn't re-fetch over them.
       setTracks(prev => prev.map(t =>
         t.handle.id === trackId
-          ? { ...t, isGenerating: false, error: null, role: newRole, hasMidi: true, generationProgress: 0 }
+          ? {
+              ...t,
+              isGenerating: false,
+              error: null,
+              role: newRole,
+              hasMidi: true,
+              generationProgress: 0,
+              editNotes: processedNotes,
+              editBars: musicalContext.bars,
+              editBpm: musicalContext.bpm,
+            }
           : t
       ));
+      editLoadStartedRef.current.add(trackId);
       // Fresh baseline — clear history; the next shuffle lazy-seeds this preset.
       soundHistory.clear(trackId);
       host.showToast('success', 'MIDI generated');
@@ -970,6 +1011,66 @@ export function SynthGeneratorPanel({
     }
   }, [host, tracks]);
 
+  // --- Piano-roll edit: load + save ------------------------------------
+  // LOAD: read the track's current MIDI back from the engine the first time
+  // the Edit tab opens. Reads LIVE engine state (reflects unsaved generator
+  // output). Degrades to an empty editor if the host predates readMidiNotes
+  // (optional method) or the track has no clip. Also pulls bars/bpm so the
+  // grid is sized correctly and re-saves preserve the loop span.
+  const loadEditNotes = useCallback(async (trackId: string): Promise<void> => {
+    try {
+      const mc = await host.getMusicalContext();
+      let notes: PluginMidiNote[] = [];
+      if (typeof host.readMidiNotes === 'function') {
+        const result = await host.readMidiNotes(trackId);
+        notes = result.clips[0]?.notes ?? [];
+      }
+      setTracks(prev => prev.map(t =>
+        t.handle.id === trackId
+          ? { ...t, editNotes: notes, editBars: mc.bars, editBpm: mc.bpm }
+          : t
+      ));
+    } catch (err: unknown) {
+      console.warn('[SynthGeneratorPanel] Failed to load MIDI for editing:', err);
+    }
+  }, [host]);
+
+  // SAVE: optimistic local update, then debounced (300 ms) persist so a burst
+  // of drags/clicks coalesces into one writeMidiClip. Empty note arrays go
+  // through clearMidi (writeMidiClip rejects empty MIDI as INVALID_MIDI).
+  // Notes persist as quarter-note beats (tempo/span-independent) — the
+  // endTime/tempo only set the clip's loop span. Stable ([host]) to avoid
+  // re-subscribing the editor / triggering load loops.
+  const handleNotesChange = useCallback((trackId: string, notes: PluginMidiNote[]): void => {
+    setTracks(prev => prev.map(t =>
+      t.handle.id === trackId ? { ...t, editNotes: notes } : t
+    ));
+    const key = `edit:${trackId}`;
+    if (saveTimeoutRefs.current[key]) {
+      clearTimeout(saveTimeoutRefs.current[key]);
+    }
+    saveTimeoutRefs.current[key] = setTimeout(() => {
+      void (async (): Promise<void> => {
+        try {
+          if (notes.length === 0) {
+            await host.clearMidi(trackId);
+          } else {
+            const mc = await host.getMusicalContext();
+            await host.writeMidiClip(trackId, {
+              startTime: 0,
+              endTime: (mc.bars * 4 * 60) / mc.bpm,
+              tempo: mc.bpm,
+              notes,
+            });
+          }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          host.showToast('error', 'Failed to save edit', msg);
+        }
+      })();
+    }, 300);
+  }, [host]);
+
   // Tab-strip clicks: switch the active tab, keeping the drawer open. Refresh
   // FX state when entering FX; lazy-load instruments when entering Pick.
   const handleTabChange = useCallback((trackId: string, tab: DrawerTab): void => {
@@ -990,8 +1091,12 @@ export function SynthGeneratorPanel({
       }).catch(() => {}).finally(() => {
         setInstrumentsLoading(false);
       });
+    } else if (tab === 'edit' && !editLoadStartedRef.current.has(trackId)) {
+      // Lazy-load the track's MIDI the first time the Edit tab is opened.
+      editLoadStartedRef.current.add(trackId);
+      void loadEditNotes(trackId);
     }
-  }, [host, availableInstruments.length, instrumentsLoading]);
+  }, [host, availableInstruments.length, instrumentsLoading, loadEditNotes]);
 
   // --- Progress persistence callback ------------------------------------
   const handleProgressChange = useCallback((trackId: string, pct: number): void => {
@@ -1205,6 +1310,12 @@ export function SynthGeneratorPanel({
                 onToggleFavorite={(i: number) => soundHistory.toggleFavorite(loadedTrack.handle.id, i)}
                 onImportSound={() => setSoundImportTarget(loadedTrack)}
                 importSoundLabel="Import Preset"
+                editNotes={loadedTrack.editNotes}
+                onNotesChange={(notes) => handleNotesChange(loadedTrack.handle.id, notes)}
+                editBars={loadedTrack.editBars}
+                editBpm={loadedTrack.editBpm}
+                editSnap={0.25}
+                onAuditionNote={(pitch, vel, ms) => { void host.auditionNote(loadedTrack.handle.id, pitch, vel, ms); }}
               />
             );
           }
@@ -1253,9 +1364,10 @@ export function SynthGeneratorPanel({
       {isLoadingTracks ? (
         <div className="text-sas-muted text-xs text-center py-4">Loading tracks...</div>
       ) : (
-        tracks.map((track: SynthTrackState) => (
+        tracks.map((track: SynthTrackState, index: number) => (
           <TrackRow
             key={track.handle.id}
+            drag={reorder.dragPropsFor(index)}
             track={{ id: track.handle.id, name: track.handle.name, role: track.role }}
             prompt={track.prompt}
             runtimeState={{
@@ -1306,6 +1418,12 @@ export function SynthGeneratorPanel({
             onToggleFavorite={(i: number) => soundHistory.toggleFavorite(track.handle.id, i)}
             onImportSound={() => setSoundImportTarget(track)}
             importSoundLabel="Import Preset"
+            editNotes={track.editNotes}
+            onNotesChange={(notes) => handleNotesChange(track.handle.id, notes)}
+            editBars={track.editBars}
+            editBpm={track.editBpm}
+            editSnap={0.25}
+            onAuditionNote={(pitch, vel, ms) => { void host.auditionNote(track.handle.id, pitch, vel, ms); }}
           />
         ))
       )}
