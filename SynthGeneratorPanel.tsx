@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useSceneState, useSoundHistory, useTrackReorder, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
 
 // ============================================================================
 // Constants
@@ -183,6 +183,8 @@ export function SynthGeneratorPanel({
     [host, activeSceneId],
   );
   const soundHistory = useSoundHistory(applySynthSound, { max: 12, onChange: persistSoundHistory });
+  // Cross-panel: dim non-soloed rows when ANY track (any panel) is soloed.
+  const anySolo = useAnySolo(host);
 
   // Drag-to-reorder rows. Shared SDK hook (identical wiring in every panel):
   // optimistic local reorder + persist via host.reorderTracks. Persist by the
@@ -582,6 +584,48 @@ export function SynthGeneratorPanel({
       setIsAddingTrack(false);
     }
   }, [host, activeSceneId, isConnected, isAuthenticated, tracks.length, onExpandSelf]);
+
+  // Cross-panel import ("re-sound a part on a synth"): pull a MIDI part out of a
+  // track owned by ANOTHER panel in THIS scene and play it on a fresh Surge
+  // patch. The sound never carries across families — that's the point — so we
+  // create our own track, copy only the MIDI + role, and shuffle a preset.
+  // Ordering matters: createTrack registers ownership synchronously, so the
+  // owned writes below (setTrackRole/writeMidiClip/shufflePreset) are safe.
+  const handlePortTrack = useCallback(
+    async (sel: { sourceTrackDbId: string; trackName: string; role?: string }): Promise<void> => {
+      if (!activeSceneId) { host.showToast('warning', 'Select SCENE'); return; }
+      if (!isConnected) { host.showToast('warning', 'Systems not connected'); return; }
+      if (tracks.length >= MAX_TRACKS) { host.showToast('warning', 'Track limit reached'); return; }
+      if (!host.readImportableTrackMidi) return;
+      let handle: PluginTrackHandle | null = null;
+      try {
+        handle = await host.createTrack({ name: `synth-${Date.now()}`, loadSynth: true, synthName: 'Surge XT' });
+        if (sel.role) {
+          try { await host.setTrackRole(handle.id, sel.role); } catch { /* non-fatal: MIDI still ports */ }
+        }
+        const midi = await host.readImportableTrackMidi(sel.sourceTrackDbId);
+        const notes = midi.clips[0]?.notes ?? [];
+        if (notes.length > 0) {
+          const mc = await host.getMusicalContext();
+          await host.writeMidiClip(handle.id, {
+            startTime: 0,
+            endTime: (mc.bars * 4 * 60) / mc.bpm,
+            tempo: mc.bpm,
+            notes,
+          });
+        }
+        // Native, role-appropriate Surge preset (keeps the default patch on failure).
+        try { await host.shufflePreset(handle.id); } catch { /* non-fatal */ }
+        host.showToast('success', 'Imported to synth', notes.length ? `${sel.trackName} → synth` : `${sel.trackName} (no MIDI yet)`);
+        await loadTracks(true);
+      } catch (err: unknown) {
+        // Roll back the half-made track we created (we own it).
+        if (handle) { try { await host.deleteTrack(handle.id); } catch { /* best effort */ } }
+        host.showToast('error', 'Import failed', err instanceof Error ? err.message : String(err));
+      }
+    },
+    [host, activeSceneId, isConnected, tracks.length, loadTracks],
+  );
 
   // --- Export tracks as MIDI bundle -------------------------------------
   const [isExportingMidi, setIsExportingMidi] = useState(false);
@@ -1274,6 +1318,7 @@ export function SynthGeneratorPanel({
                   volume: loadedTrack.runtimeState.volume,
                   pan: loadedTrack.runtimeState.pan,
                 }}
+                soloedOut={anySolo && !loadedTrack.runtimeState.solo}
                 fxDetailState={loadedTrack.fxDetailState}
                 drawerOpen={loadedTrack.drawerOpen}
                 drawerTab={loadedTrack.drawerTab}
@@ -1352,6 +1397,7 @@ export function SynthGeneratorPanel({
           open={importOpen}
           onClose={() => setImportOpen(false)}
           onImported={() => { void loadTracks(true); }}
+          onPortTrack={host.readImportableTrackMidi ? handlePortTrack : undefined}
           testIdPrefix="synth-import"
         />
       )}
@@ -1382,6 +1428,7 @@ export function SynthGeneratorPanel({
               volume: track.runtimeState.volume,
               pan: track.runtimeState.pan,
             }}
+            soloedOut={anySolo && !track.runtimeState.solo}
             fxDetailState={track.fxDetailState}
             drawerOpen={track.drawerOpen}
             drawerTab={track.drawerTab}
