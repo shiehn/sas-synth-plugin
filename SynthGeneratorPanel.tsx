@@ -149,23 +149,29 @@ export function SynthGeneratorPanel({
   const tracksLoadedForSceneRef = useRef<string | null>(null);
 
   // --- Sound history (↩ back-arrow + drawer "History" tab) --------------
-  // A synth "sound" is its Surge XT plugin state (base64): snapshot via
-  // getPluginState at the Surge plugin's index, restore via setPluginState.
-  const getSurgeIndex = useCallback(async (trackId: string): Promise<number | null> => {
+  // A synth "sound" is its INSTRUMENT plugin state (base64): snapshot via
+  // getPluginState at the instrument plugin's index, restore via
+  // setPluginState. The instrument is the first non-utility plugin — Surge XT
+  // on default tracks, or a third-party VST3 (e.g. u-he Diva) when the user
+  // picked a custom instrument. Matching only 'Surge' silently broke history
+  // (capture AND apply no-op'd) for custom-instrument tracks.
+  const getInstrumentIndex = useCallback(async (trackId: string): Promise<number | null> => {
     try {
       const plugins = await host.getTrackPlugins(trackId);
-      const surge = plugins.find((p) => p.name.includes('Surge'));
-      return surge ? surge.index : null;
+      const instrument = plugins.find(
+        (p) => !p.name.includes('Volume') && !p.name.includes('Pan') && !p.name.includes('Level'),
+      );
+      return instrument ? instrument.index : null;
     } catch {
       return null;
     }
   }, [host]);
   const applySynthSound = useCallback(async (trackId: string, descriptor: unknown): Promise<void> => {
     const { state } = descriptor as { state: string };
-    const idx = await getSurgeIndex(trackId);
+    const idx = await getInstrumentIndex(trackId);
     if (idx == null) return;
     await host.setPluginState(trackId, idx, state);
-  }, [host, getSurgeIndex]);
+  }, [host, getInstrumentIndex]);
   // Persist per-track history to project scene-data so it survives reopen.
   // Surge state blobs are large, so cap synth history tighter than samples.
   const persistSoundHistory = useCallback(
@@ -214,7 +220,7 @@ export function SynthGeneratorPanel({
     [soundImportTarget, host, applySynthSound, soundHistory],
   );
   const captureSynthSound = useCallback(async (trackId: string, label: string): Promise<void> => {
-    const idx = await getSurgeIndex(trackId);
+    const idx = await getInstrumentIndex(trackId);
     if (idx == null) return;
     try {
       const state = await host.getPluginState(trackId, idx);
@@ -222,7 +228,7 @@ export function SynthGeneratorPanel({
     } catch {
       // Non-fatal — history just won't include this sound.
     }
-  }, [host, getSurgeIndex, soundHistory]);
+  }, [host, getInstrumentIndex, soundHistory]);
 
   const loadTracks = useCallback(async (incremental = false): Promise<void> => {
     // Snapshot the scene this load is for. Each subsequent await is a chance
