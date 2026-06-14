@@ -155,23 +155,35 @@ export function SynthGeneratorPanel({
   // on default tracks, or a third-party VST3 (e.g. u-he Diva) when the user
   // picked a custom instrument. Matching only 'Surge' silently broke history
   // (capture AND apply no-op'd) for custom-instrument tracks.
-  const getInstrumentIndex = useCallback(async (trackId: string): Promise<number | null> => {
-    try {
-      const plugins = await host.getTrackPlugins(trackId);
-      const instrument = plugins.find(
-        (p) => !p.name.includes('Volume') && !p.name.includes('Pan') && !p.name.includes('Level'),
-      );
-      return instrument ? instrument.index : null;
-    } catch {
-      return null;
-    }
-  }, [host]);
+  // Resolve the track's instrument (first non-utility plugin) plus how its
+  // state serializes: default Surge XT round-trips through the Tracktion
+  // ValueTree (get/setPluginState); third-party instruments (u-he Diva, Serum,
+  // …) need their RAW VST3 state (get/setRawPluginState), which the ValueTree
+  // wrapper does not faithfully preserve.
+  const getInstrument = useCallback(
+    async (trackId: string): Promise<{ index: number; isRaw: boolean } | null> => {
+      try {
+        const plugins = await host.getTrackPlugins(trackId);
+        const instrument = plugins.find(
+          (p) => !p.name.includes('Volume') && !p.name.includes('Pan') && !p.name.includes('Level'),
+        );
+        if (!instrument) return null;
+        return { index: instrument.index, isRaw: !instrument.name.includes('Surge') };
+      } catch {
+        return null;
+      }
+    },
+    [host],
+  );
   const applySynthSound = useCallback(async (trackId: string, descriptor: unknown): Promise<void> => {
-    const { state } = descriptor as { state: string };
-    const idx = await getInstrumentIndex(trackId);
-    if (idx == null) return;
-    await host.setPluginState(trackId, idx, state);
-  }, [host, getInstrumentIndex]);
+    const { state, stateType } = descriptor as { state: string; stateType?: 'raw' | 'valuetree' };
+    const inst = await getInstrument(trackId);
+    if (!inst) return;
+    // Restore through the setter matching how the sound was captured. Absent
+    // stateType ⇒ ValueTree (history recorded before the raw/ValueTree split).
+    if (stateType === 'raw') await host.setRawPluginState(trackId, inst.index, state);
+    else await host.setPluginState(trackId, inst.index, state);
+  }, [host, getInstrument]);
   // Persist per-track history to project scene-data so it survives reopen.
   // Surge state blobs are large, so cap synth history tighter than samples.
   const persistSoundHistory = useCallback(
@@ -209,7 +221,7 @@ export function SynthGeneratorPanel({
           host.showToast('error', 'No preset to import', `${sel.trackName} has no synth preset.`);
           return;
         }
-        const descriptor = { state: snap.state };
+        const descriptor = { state: snap.state, stateType: snap.stateType };
         await applySynthSound(target.handle.id, descriptor);
         soundHistory.record(target.handle.id, descriptor, snap.label);
         host.showToast('success', 'Preset imported', `${snap.label} → ${target.handle.name}`);
@@ -222,15 +234,19 @@ export function SynthGeneratorPanel({
     [soundImportTarget, host, applySynthSound, soundHistory],
   );
   const captureSynthSound = useCallback(async (trackId: string, label: string): Promise<void> => {
-    const idx = await getInstrumentIndex(trackId);
-    if (idx == null) return;
+    const inst = await getInstrument(trackId);
+    if (!inst) return;
     try {
-      const state = await host.getPluginState(trackId, idx);
-      soundHistory.record(trackId, { state }, label);
+      // Capture in the instrument's native serialization so restore is faithful:
+      // raw VST3 for third-party instruments, ValueTree for Surge.
+      const state = inst.isRaw
+        ? await host.getRawPluginState(trackId, inst.index)
+        : await host.getPluginState(trackId, inst.index);
+      soundHistory.record(trackId, { state, stateType: inst.isRaw ? 'raw' : 'valuetree' }, label);
     } catch {
       // Non-fatal — history just won't include this sound.
     }
-  }, [host, getInstrumentIndex, soundHistory]);
+  }, [host, getInstrument, soundHistory]);
 
   const loadTracks = useCallback(async (incremental = false): Promise<void> => {
     // Snapshot the scene this load is for. Each subsequent await is a chance
