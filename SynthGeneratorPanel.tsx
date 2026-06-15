@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels } from '@signalsandsorcery/plugin-sdk';
 
 // ============================================================================
 // Constants
@@ -121,6 +121,14 @@ export function SynthGeneratorPanel({
   onOpenContract,
   onExpandSelf,
 }: PluginUIProps): React.ReactElement {
+  // Cosmetic per-track peak meters. Poll while the panel is mounted + visible;
+  // NOT gated on transport state (this app plays via decks/clip-launcher, so the
+  // linear "is playing" flag is unreliable). Stopped tracks just read the floor.
+  // The host coalesces the read so playback always wins over the GUI. Older
+  // hosts (no getTrackLevels) degrade to no meter via the `supportsMeters` guard.
+  const supportsMeters = typeof host.getTrackLevels === 'function';
+  const trackLevels = useTrackLevels(host);
+
   const [tracks, setTracks] = useState<SynthTrackState[]>([]);
   const [isLoadingTracks, setIsLoadingTracks] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
@@ -1327,6 +1335,7 @@ export function SynthGeneratorPanel({
               <TrackRow
                 key={ph.id}
                 track={{ id: loadedTrack.handle.id, name: loadedTrack.handle.name, role: loadedTrack.role }}
+                levels={supportsMeters ? trackLevels : undefined}
                 prompt={loadedTrack.prompt}
                 runtimeState={{
                   muted: loadedTrack.runtimeState.muted,
@@ -1437,6 +1446,7 @@ export function SynthGeneratorPanel({
             key={track.handle.id}
             drag={reorder.dragPropsFor(index)}
             track={{ id: track.handle.id, name: track.handle.name, role: track.role }}
+            levels={supportsMeters ? trackLevels : undefined}
             prompt={track.prompt}
             runtimeState={{
               muted: track.runtimeState.muted,
