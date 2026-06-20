@@ -394,7 +394,25 @@ export function SynthGeneratorPanel({
         });
       }
       if (isStale()) return;
-      setTracks(trackStates);
+      // Carry forward the in-memory piano-roll edit buffer (editNotes/Bars/Bpm)
+      // for tracks that still exist, matched by stable DB UUID. loadTracks
+      // rebuilds every track with editNotes:[], but editLoadStartedRef is a
+      // permanent "loaded once" latch (set on generation / first Edit-tab open,
+      // never cleared). A reload fired after a generation — instrument swap,
+      // agent mutation, engine-ready, or the 30s project sync — would otherwise
+      // wipe the seeded notes while the latch still marks the track loaded, so
+      // opening the Edit tab skips the engine refetch and shows an empty piano
+      // roll even though the MIDI is safe in the engine + DB. Preserving the
+      // buffer keeps editLoadStartedRef and editNotes consistent.
+      setTracks(prev => {
+        const prevByDbId = new Map(prev.map(p => [p.handle.dbId, p]));
+        return trackStates.map(ts => {
+          const carry = prevByDbId.get(ts.handle.dbId);
+          return carry
+            ? { ...ts, editNotes: carry.editNotes, editBars: carry.editBars, editBpm: carry.editBpm }
+            : ts;
+        });
+      });
       // Restore persisted history so it survives reopen. Lazy-seed (first shuffle)
       // still covers tracks with no saved history.
       for (const ts of trackStates) {
