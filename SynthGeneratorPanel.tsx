@@ -8,7 +8,7 @@
  * Delegates all track UI rendering to the reusable SDK TrackRow component.
  */
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import type {
   PluginUIProps,
   PluginTrackHandle,
@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, type CrossfadeSlot, type CrossfadeSelection } from '@signalsandsorcery/plugin-sdk';
 
 // ============================================================================
 // Constants
@@ -106,6 +106,113 @@ interface LLMNoteResponse {
 }
 
 // ============================================================================
+// Crossfade tracks (transition scenes)
+// ============================================================================
+
+/**
+ * Equal-power center gain (~-3 dB, 1/√2) applied to BOTH crossfade layers so a
+ * centered, non-functional slider already sounds like a midpoint blend. The
+ * per-layer volume sliders start here; a later phase's fader drives them.
+ */
+const EQUAL_POWER_GAIN = 0.707;
+
+/**
+ * Per-member crossfade metadata, persisted in scene plugin_data under
+ * `track:<dbId>:crossfade`. Two member tracks (origin/target) share a groupId;
+ * both play the same MIDI but wear the origin/target preset respectively.
+ */
+interface CrossfadeMeta {
+  groupId: string;
+  slot: CrossfadeSlot;
+  partnerDbId: string;
+  /** DB id of the SOURCE track this layer's preset was copied from. */
+  sourceTrackDbId: string;
+  /** DB id of the scene the source track lives in (from/to scene). */
+  sourceSceneId: string;
+  /** Source track display name (caption). */
+  sourceName: string;
+  /** Copied preset label (caption). */
+  soundLabel: string;
+  /** Crossfade position 0..1 (same on both members). */
+  sliderPos: number;
+}
+
+/** A complete crossfade pair (both members present), keyed by groupId. */
+interface CrossfadePairMeta {
+  groupId: string;
+  sliderPos: number;
+  originDbId: string;
+  targetDbId: string;
+  originSourceName: string;
+  originSoundLabel: string;
+  targetSourceName: string;
+  targetSoundLabel: string;
+}
+
+/** A crossfade pair resolved against live track state (both members present). */
+interface ResolvedCrossfadePair extends CrossfadePairMeta {
+  origin: SynthTrackState;
+  target: SynthTrackState;
+}
+
+/** Narrow an unknown scene-data value to CrossfadeMeta. */
+function asCrossfadeMeta(val: unknown): CrossfadeMeta | null {
+  if (!val || typeof val !== 'object') return null;
+  const m = val as Partial<CrossfadeMeta>;
+  if (typeof m.groupId !== 'string' || (m.slot !== 'origin' && m.slot !== 'target')) return null;
+  if (typeof m.partnerDbId !== 'string') return null;
+  return {
+    groupId: m.groupId,
+    slot: m.slot,
+    partnerDbId: m.partnerDbId,
+    sourceTrackDbId: typeof m.sourceTrackDbId === 'string' ? m.sourceTrackDbId : '',
+    sourceSceneId: typeof m.sourceSceneId === 'string' ? m.sourceSceneId : '',
+    sourceName: typeof m.sourceName === 'string' ? m.sourceName : '',
+    soundLabel: typeof m.soundLabel === 'string' ? m.soundLabel : '',
+    sliderPos: typeof m.sliderPos === 'number' ? m.sliderPos : 0.5,
+  };
+}
+
+/**
+ * Scan all `track:<dbId>:crossfade` keys in a scene's plugin_data and assemble
+ * COMPLETE pairs (both origin + target present). A half-broken group (partner
+ * deleted underneath) is omitted, so its surviving member falls back to a
+ * normal row instead of vanishing.
+ */
+function parseCrossfadePairs(sceneData: Record<string, unknown>): CrossfadePairMeta[] {
+  const groups = new Map<
+    string,
+    { origin?: { dbId: string; meta: CrossfadeMeta }; target?: { dbId: string; meta: CrossfadeMeta } }
+  >();
+  for (const [key, val] of Object.entries(sceneData)) {
+    const match = /^track:(.+):crossfade$/.exec(key);
+    if (!match) continue;
+    const meta = asCrossfadeMeta(val);
+    if (!meta) continue;
+    const dbId = match[1];
+    const g = groups.get(meta.groupId) ?? {};
+    if (meta.slot === 'origin') g.origin = { dbId, meta };
+    else g.target = { dbId, meta };
+    groups.set(meta.groupId, g);
+  }
+  const pairs: CrossfadePairMeta[] = [];
+  for (const [groupId, g] of groups) {
+    if (!g.origin || !g.target) continue;
+    pairs.push({
+      groupId,
+      sliderPos: g.origin.meta.sliderPos,
+      originDbId: g.origin.dbId,
+      targetDbId: g.target.dbId,
+      originSourceName: g.origin.meta.sourceName,
+      originSoundLabel: g.origin.meta.soundLabel,
+      targetSourceName: g.target.meta.sourceName,
+      targetSoundLabel: g.target.meta.soundLabel,
+    });
+  }
+  return pairs;
+}
+
+// ============================================================================
 // SynthGeneratorPanel
 // ============================================================================
 
@@ -133,6 +240,11 @@ export function SynthGeneratorPanel({
   const [isLoadingTracks, setIsLoadingTracks] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [soundImportTarget, setSoundImportTarget] = useState<SynthTrackState | null>(null);
+  // Crossfade tracks (transition scenes): the "+ Crossfade" modal + the parsed
+  // pair metadata for the active scene (members are normal tracks linked via
+  // scene-data; the render layer groups them into one CrossfadeTrackRow).
+  const [crossfadeOpen, setCrossfadeOpen] = useState(false);
+  const [crossfadePairsMeta, setCrossfadePairsMeta] = useState<CrossfadePairMeta[]>([]);
   // Scene-keyed compose state: preserved when switching scenes via SDK hook
   const [isComposing, , setIsComposingForScene] = useSceneState(activeSceneId, false);
   const [placeholders, , setPlaceholdersForScene] = useSceneState<BulkAddPlaceholderTrack[]>(activeSceneId, EMPTY_PLACEHOLDERS);
@@ -266,6 +378,7 @@ export function SynthGeneratorPanel({
     const sceneAtStart = activeSceneId;
     if (!sceneAtStart) {
       setTracks([]);
+      setCrossfadePairsMeta([]);
       tracksLoadedForSceneRef.current = null;
       // No scene → nothing to load → not loading. Without this, a load that
       // had already set isLoadingTracks=true (line below) and is then
@@ -421,6 +534,10 @@ export function SynthGeneratorPanel({
           soundHistory.restore(ts.handle.id, persisted as TrackSoundHistory);
         }
       }
+      // Group crossfade members (normal tracks linked by a shared groupId in
+      // scene-data) into pairs. Members render as one CrossfadeTrackRow; the
+      // render layer excludes their standalone rows.
+      if (!isStale()) setCrossfadePairsMeta(parseCrossfadePairs(sceneData));
     } catch (error: unknown) {
       console.error('[SynthGeneratorPanel] Failed to load tracks:', error);
     } finally {
@@ -669,6 +786,118 @@ export function SynthGeneratorPanel({
     [host, activeSceneId, isConnected, tracks.length, loadTracks],
   );
 
+  // --- Create a crossfade pair (transition scenes) ----------------------
+  // Two tracks share ONE generated MIDI clip: the top wears the ORIGIN scene
+  // track's preset, the bottom wears the TARGET's. The user can't
+  // regen/shuffle/preset-swap them (CrossfadeTrackRow omits those controls).
+  // One-action: generate → create both → write same MIDI → copy presets →
+  // equal-power volumes → persist pairing. LIFO rollback on any failure.
+  // Throws on failure so the modal surfaces it and stays open.
+  const [isCreatingCrossfade, setIsCreatingCrossfade] = useState(false);
+  const handleCreateCrossfade = useCallback(
+    async (origin: CrossfadeSelection, target: CrossfadeSelection): Promise<void> => {
+      const scene = activeSceneId;
+      const fromSceneId = sceneContext?.transitionFromSceneId ?? '';
+      const toSceneId = sceneContext?.transitionToSceneId ?? '';
+      if (!scene) throw new Error('No active scene.');
+      if (!isConnected) throw new Error('Systems not connected.');
+      if (!isAuthenticated) throw new Error('Please sign in to generate the bridge.');
+      if (tracks.length + 2 > MAX_TRACKS) throw new Error('Not enough track slots for a crossfade.');
+
+      setIsCreatingCrossfade(true);
+      const created: PluginTrackHandle[] = [];
+      try {
+        const role = origin.role ?? target.role ?? '';
+
+        // 1. Generate ONE bridge clip from the transition's chords (auto-prefixed
+        // via the musical context). Done BEFORE creating tracks so the two empty
+        // layers don't pollute the generation context. Phase 2 will inpaint
+        // origin→target instead of generating standalone from the chords.
+        const mc = await host.getMusicalContext();
+        const genCtx = await host.getGenerationContext();
+        const concurrentBlock = formatConcurrentTracks(genCtx);
+        const userPrompt = [
+          concurrentBlock || undefined,
+          concurrentBlock ? '' : undefined,
+          `This is a TRANSITION bridge. Generate a ${role || 'synth'} part over the transition's chord progression that carries "${origin.name}" into "${target.name}".`,
+        ]
+          .filter((l): l is string => l !== undefined)
+          .join('\n');
+        const llm = await host.generateWithLLM({
+          system: buildMidiSystemPrompt(host.getValidRoles()),
+          user: userPrompt,
+          responseFormat: 'json',
+        });
+        const parsed = parseLLMNoteResponse(llm.content);
+        if (!parsed || parsed.notes.length === 0) {
+          throw new Error('The bridge generator returned no notes.');
+        }
+        const notes = await host.postProcessMidi(parsed.notes, { quantize: true, removeOverlaps: true });
+        const clip: MidiClipData = {
+          startTime: 0,
+          endTime: (mc.bars * 4 * 60) / mc.bpm,
+          tempo: mc.bpm,
+          notes,
+        };
+
+        // 2. Create the two layer tracks (default Surge; preset copied below).
+        const top = await host.createTrack({ name: `synth-${Date.now()}-xf-o`, loadSynth: true, synthName: 'Surge XT' });
+        created.push(top);
+        const bottom = await host.createTrack({ name: `synth-${Date.now()}-xf-t`, loadSynth: true, synthName: 'Surge XT' });
+        created.push(bottom);
+        if (role) {
+          await host.setTrackRole(top.id, role).catch(() => {});
+          await host.setTrackRole(bottom.id, role).catch(() => {});
+        }
+
+        // 3. SAME MIDI on both layers.
+        await host.writeMidiClip(top.id, clip);
+        await host.writeMidiClip(bottom.id, clip);
+
+        // 4. Copy each source preset onto its layer (exact sound — no shuffle).
+        const copyPreset = async (newTrackId: string, sourceDbId: string): Promise<string> => {
+          if (!host.getTrackSound) return 'default';
+          const snap = await host.getTrackSound(sourceDbId);
+          if (!snap || snap.kind !== 'preset') return 'default';
+          await applySynthSound(newTrackId, { state: snap.state, stateType: snap.stateType });
+          return snap.label;
+        };
+        const originLabel = await copyPreset(top.id, origin.dbId);
+        const targetLabel = await copyPreset(bottom.id, target.dbId);
+
+        // 5. Equal-power center so the centered (non-functional) slider already
+        // sounds like a midpoint blend. Leave unmuted — the point is to hear it.
+        await host.setTrackVolume(top.id, EQUAL_POWER_GAIN).catch(() => {});
+        await host.setTrackVolume(bottom.id, EQUAL_POWER_GAIN).catch(() => {});
+
+        // 6. Persist the pairing (one key per member, shared groupId).
+        const groupId = top.dbId;
+        const originMeta: CrossfadeMeta = {
+          groupId, slot: 'origin', partnerDbId: bottom.dbId, sourceTrackDbId: origin.dbId,
+          sourceSceneId: fromSceneId, sourceName: origin.name, soundLabel: originLabel, sliderPos: 0.5,
+        };
+        const targetMeta: CrossfadeMeta = {
+          groupId, slot: 'target', partnerDbId: top.dbId, sourceTrackDbId: target.dbId,
+          sourceSceneId: toSceneId, sourceName: target.name, soundLabel: targetLabel, sliderPos: 0.5,
+        };
+        await host.setSceneData(scene, `track:${top.dbId}:crossfade`, originMeta);
+        await host.setSceneData(scene, `track:${bottom.dbId}:crossfade`, targetMeta);
+
+        await loadTracks(true);
+        host.showToast('success', 'Crossfade created', `${origin.name} → ${target.name}`);
+      } catch (err: unknown) {
+        // LIFO rollback — delete any track we created.
+        for (const h of [...created].reverse()) {
+          try { await host.deleteTrack(h.id); } catch { /* best effort */ }
+        }
+        throw err instanceof Error ? err : new Error(String(err));
+      } finally {
+        setIsCreatingCrossfade(false);
+      }
+    },
+    [host, activeSceneId, isConnected, isAuthenticated, tracks.length, sceneContext, applySynthSound, loadTracks],
+  );
+
   // --- Export tracks as MIDI bundle -------------------------------------
   const [isExportingMidi, setIsExportingMidi] = useState(false);
   const handleExportMidi = useCallback(async (): Promise<void> => {
@@ -699,6 +928,12 @@ export function SynthGeneratorPanel({
   // --- Push header content (Add button) to accordion header -------------
   const isBulkActive = !!(isComposing || placeholders.length > 0);
   const needsContract = !sceneContext?.hasContract;
+  // Crossfade is only offered inside a transition scene that knows both the
+  // scenes it bridges, and only when the host supports the picker.
+  const xfFromId = sceneContext?.transitionFromSceneId ?? null;
+  const xfToId = sceneContext?.transitionToSceneId ?? null;
+  const canCrossfade =
+    sceneContext?.sceneType === 'transition' && !!xfFromId && !!xfToId && !!host.listSceneFamilyTracks;
   useEffect(() => {
     if (!onHeaderContent) return;
     const addDisabled =
@@ -743,11 +978,31 @@ export function SynthGeneratorPanel({
         >
           Add Track
         </button>
+        {canCrossfade && (
+          <button
+            data-testid="add-crossfade-button"
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              if (needsContract) { onOpenContract?.(); return; }
+              onExpandSelf?.();
+              setCrossfadeOpen(true);
+            }}
+            disabled={!activeSceneId || needsContract || isCreatingCrossfade || tracks.length + 2 > MAX_TRACKS}
+            className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
+              !activeSceneId || needsContract || isCreatingCrossfade || tracks.length + 2 > MAX_TRACKS
+                ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
+                : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
+            }`}
+            title="Crossfade an origin track into a target track over this transition"
+          >
+            + Crossfade
+          </button>
+        )}
       </div>
     );
     return () => { onHeaderContent(null); };
   }, [onHeaderContent, needsContract, isConnected, activeSceneId, tracks.length, isAddingTrack,
-      handleAddTrack, onOpenContract, host]);
+      handleAddTrack, onOpenContract, host, canCrossfade, isCreatingCrossfade, onExpandSelf]);
 
   // --- Push loading state to accordion header ---------------------------
   useEffect(() => {
@@ -770,6 +1025,40 @@ export function SynthGeneratorPanel({
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
       host.showToast('error', 'Failed to delete track', msg);
+    }
+  }, [host, activeSceneId]);
+
+  // --- Crossfade group controls -----------------------------------------
+  // Mute/solo act on BOTH layers together (group); per-layer volume/pan reuse
+  // the normal handlers (members are normal tracks in `tracks`). Delete removes
+  // the whole pair + its scene-data keys.
+  const handleCrossfadeMute = useCallback((pair: ResolvedCrossfadePair): void => {
+    const newMuted = !pair.origin.runtimeState.muted;
+    for (const id of [pair.origin.handle.id, pair.target.handle.id]) {
+      setTracks(prev => prev.map(t => (t.handle.id === id ? { ...t, runtimeState: { ...t.runtimeState, muted: newMuted } } : t)));
+      host.setTrackMute(id, newMuted).catch(() => {});
+    }
+  }, [host]);
+
+  const handleCrossfadeSolo = useCallback((pair: ResolvedCrossfadePair): void => {
+    const newSolo = !pair.origin.runtimeState.solo;
+    for (const id of [pair.origin.handle.id, pair.target.handle.id]) {
+      setTracks(prev => prev.map(t => (t.handle.id === id ? { ...t, runtimeState: { ...t.runtimeState, solo: newSolo } } : t)));
+      host.setTrackSolo(id, newSolo).catch(() => {});
+    }
+  }, [host]);
+
+  const handleCrossfadeDelete = useCallback(async (pair: ResolvedCrossfadePair): Promise<void> => {
+    try {
+      for (const member of [pair.origin, pair.target]) {
+        await host.deleteTrack(member.handle.id);
+        if (activeSceneId) await host.deleteSceneData(activeSceneId, `track:${member.handle.dbId}:crossfade`);
+      }
+      setCrossfadePairsMeta(prev => prev.filter(p => p.groupId !== pair.groupId));
+      setTracks(prev => prev.filter(t => t.handle.id !== pair.origin.handle.id && t.handle.id !== pair.target.handle.id));
+      host.showToast('success', 'Crossfade removed');
+    } catch (err: unknown) {
+      host.showToast('error', 'Failed to delete crossfade', err instanceof Error ? err.message : String(err));
     }
   }, [host, activeSceneId]);
 
@@ -1290,6 +1579,25 @@ export function SynthGeneratorPanel({
     });
   }, [host]);
 
+  // Resolve crossfade pairs against live track state. Only COMPLETE pairs (both
+  // members present in `tracks`) group into a CrossfadeTrackRow; a half-broken
+  // pair's surviving member is left to render as a normal row (not excluded).
+  const { resolvedCrossfadePairs, crossfadeMemberDbIds } = useMemo(() => {
+    const byDbId = new Map(tracks.map((t) => [t.handle.dbId, t]));
+    const pairs: ResolvedCrossfadePair[] = [];
+    const members = new Set<string>();
+    for (const p of crossfadePairsMeta) {
+      const origin = byDbId.get(p.originDbId);
+      const target = byDbId.get(p.targetDbId);
+      if (origin && target) {
+        pairs.push({ ...p, origin, target });
+        members.add(p.originDbId);
+        members.add(p.targetDbId);
+      }
+    }
+    return { resolvedCrossfadePairs: pairs, crossfadeMemberDbIds: members };
+  }, [tracks, crossfadePairsMeta]);
+
   // --- Render -----------------------------------------------------------
 
   // No scene selected
@@ -1456,10 +1764,57 @@ export function SynthGeneratorPanel({
           testIdPrefix="synth-sound-import"
         />
       )}
+      {canCrossfade && xfFromId && xfToId && (
+        <CrossfadeModal
+          host={host}
+          open={crossfadeOpen}
+          fromSceneId={xfFromId}
+          toSceneId={xfToId}
+          onClose={() => setCrossfadeOpen(false)}
+          onCreate={handleCreateCrossfade}
+          testIdPrefix="synth-crossfade"
+        />
+      )}
       {isLoadingTracks ? (
         <div className="text-sas-muted text-xs text-center py-4">Loading tracks...</div>
       ) : (
-        tracks.map((track: SynthTrackState, index: number) => (
+        <>
+          {resolvedCrossfadePairs.map((pair) => (
+            <CrossfadeTrackRow
+              key={pair.groupId}
+              accentColor="#9333EA"
+              levels={supportsMeters ? trackLevels : undefined}
+              sliderPos={pair.sliderPos}
+              origin={{
+                trackId: pair.origin.handle.id,
+                name: pair.origin.handle.name,
+                role: pair.origin.role,
+                sourceName: pair.originSourceName,
+                soundLabel: pair.originSoundLabel,
+                runtimeState: pair.origin.runtimeState,
+              }}
+              target={{
+                trackId: pair.target.handle.id,
+                name: pair.target.handle.name,
+                role: pair.target.role,
+                sourceName: pair.targetSourceName,
+                soundLabel: pair.targetSoundLabel,
+                runtimeState: pair.target.runtimeState,
+              }}
+              onMuteToggle={() => handleCrossfadeMute(pair)}
+              onSoloToggle={() => handleCrossfadeSolo(pair)}
+              onVolumeChange={(slot: CrossfadeSlot, vol: number) =>
+                handleVolumeChange(slot === 'origin' ? pair.origin.handle.id : pair.target.handle.id, vol)
+              }
+              onPanChange={(slot: CrossfadeSlot, pan: number) =>
+                handlePanChange(slot === 'origin' ? pair.origin.handle.id : pair.target.handle.id, pan)
+              }
+              onDelete={() => handleCrossfadeDelete(pair)}
+            />
+          ))}
+          {tracks.map((track: SynthTrackState, index: number) => {
+            if (crossfadeMemberDbIds.has(track.handle.dbId)) return null;
+            return (
           <TrackRow
             key={track.handle.id}
             drag={reorder.dragPropsFor(index)}
@@ -1522,7 +1877,9 @@ export function SynthGeneratorPanel({
             editSnap={0.25}
             onAuditionNote={(pitch, vel, ms) => { void host.auditionNote(track.handle.id, pitch, vel, ms); }}
           />
-        ))
+            );
+          })}
+        </>
       )}
 
       {/* Export Tracks — bundle all synth tracks' MIDI as a ZIP */}
