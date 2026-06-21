@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, type CrossfadeSlot, type CrossfadeSelection } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, EQUAL_POWER_GAIN, parseCrossfadePairs, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta } from '@signalsandsorcery/plugin-sdk';
 
 // ============================================================================
 // Constants
@@ -106,110 +106,14 @@ interface LLMNoteResponse {
 }
 
 // ============================================================================
-// Crossfade tracks (transition scenes)
+// Crossfade tracks (transition scenes) — shared metadata + parsing live in the
+// SDK (crossfade-meta.ts); only the live-track-bound resolved pair is panel-local.
 // ============================================================================
-
-/**
- * Equal-power center gain (~-3 dB, 1/√2) applied to BOTH crossfade layers so a
- * centered, non-functional slider already sounds like a midpoint blend. The
- * per-layer volume sliders start here; a later phase's fader drives them.
- */
-const EQUAL_POWER_GAIN = 0.707;
-
-/**
- * Per-member crossfade metadata, persisted in scene plugin_data under
- * `track:<dbId>:crossfade`. Two member tracks (origin/target) share a groupId;
- * both play the same MIDI but wear the origin/target preset respectively.
- */
-interface CrossfadeMeta {
-  groupId: string;
-  slot: CrossfadeSlot;
-  partnerDbId: string;
-  /** DB id of the SOURCE track this layer's preset was copied from. */
-  sourceTrackDbId: string;
-  /** DB id of the scene the source track lives in (from/to scene). */
-  sourceSceneId: string;
-  /** Source track display name (caption). */
-  sourceName: string;
-  /** Copied preset label (caption). */
-  soundLabel: string;
-  /** Crossfade position 0..1 (same on both members). */
-  sliderPos: number;
-}
-
-/** A complete crossfade pair (both members present), keyed by groupId. */
-interface CrossfadePairMeta {
-  groupId: string;
-  sliderPos: number;
-  originDbId: string;
-  targetDbId: string;
-  originSourceName: string;
-  originSoundLabel: string;
-  targetSourceName: string;
-  targetSoundLabel: string;
-}
 
 /** A crossfade pair resolved against live track state (both members present). */
 interface ResolvedCrossfadePair extends CrossfadePairMeta {
   origin: SynthTrackState;
   target: SynthTrackState;
-}
-
-/** Narrow an unknown scene-data value to CrossfadeMeta. */
-function asCrossfadeMeta(val: unknown): CrossfadeMeta | null {
-  if (!val || typeof val !== 'object') return null;
-  const m = val as Partial<CrossfadeMeta>;
-  if (typeof m.groupId !== 'string' || (m.slot !== 'origin' && m.slot !== 'target')) return null;
-  if (typeof m.partnerDbId !== 'string') return null;
-  return {
-    groupId: m.groupId,
-    slot: m.slot,
-    partnerDbId: m.partnerDbId,
-    sourceTrackDbId: typeof m.sourceTrackDbId === 'string' ? m.sourceTrackDbId : '',
-    sourceSceneId: typeof m.sourceSceneId === 'string' ? m.sourceSceneId : '',
-    sourceName: typeof m.sourceName === 'string' ? m.sourceName : '',
-    soundLabel: typeof m.soundLabel === 'string' ? m.soundLabel : '',
-    sliderPos: typeof m.sliderPos === 'number' ? m.sliderPos : 0.5,
-  };
-}
-
-/**
- * Scan all `track:<dbId>:crossfade` keys in a scene's plugin_data and assemble
- * COMPLETE pairs (both origin + target present). A half-broken group (partner
- * deleted underneath) is omitted, so its surviving member falls back to a
- * normal row instead of vanishing.
- */
-function parseCrossfadePairs(sceneData: Record<string, unknown>): CrossfadePairMeta[] {
-  const groups = new Map<
-    string,
-    { origin?: { dbId: string; meta: CrossfadeMeta }; target?: { dbId: string; meta: CrossfadeMeta } }
-  >();
-  for (const [key, val] of Object.entries(sceneData)) {
-    const match = /^track:(.+):crossfade$/.exec(key);
-    if (!match) continue;
-    const meta = asCrossfadeMeta(val);
-    if (!meta) continue;
-    const dbId = match[1];
-    const g = groups.get(meta.groupId) ?? {};
-    if (meta.slot === 'origin') g.origin = { dbId, meta };
-    else g.target = { dbId, meta };
-    groups.set(meta.groupId, g);
-  }
-  const pairs: CrossfadePairMeta[] = [];
-  for (const [groupId, g] of groups) {
-    if (!g.origin || !g.target) continue;
-    pairs.push({
-      groupId,
-      sliderPos: g.origin.meta.sliderPos,
-      originDbId: g.origin.dbId,
-      targetDbId: g.target.dbId,
-      originSourceName: g.origin.meta.sourceName,
-      originSoundLabel: g.origin.meta.soundLabel,
-      targetSourceName: g.target.meta.sourceName,
-      targetSoundLabel: g.target.meta.soundLabel,
-    });
-  }
-  return pairs;
 }
 
 // ============================================================================
