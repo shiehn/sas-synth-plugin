@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, EQUAL_POWER_GAIN, parseCrossfadePairs, buildCrossfadeInpaintPrompt, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta } from '@signalsandsorcery/plugin-sdk';
 
 // ============================================================================
 // Constants
@@ -690,6 +690,23 @@ export function SynthGeneratorPanel({
     [host, activeSceneId, isConnected, tracks.length, loadTracks],
   );
 
+  // Apply the crossfade volume automation: origin fades out, target fades in
+  // across the loop (equal-power, crossover at sliderPos). Falls back to a static
+  // equal-power blend on hosts without setTrackVolumeAutomation.
+  const applyCrossfadeAutomation = useCallback(
+    async (originTrackId: string, targetTrackId: string, bars: number, bpm: number, sliderPos: number): Promise<void> => {
+      if (host.setTrackVolumeAutomation) {
+        const curves = buildCrossfadeVolumeCurves(bars, bpm, sliderPos);
+        await host.setTrackVolumeAutomation(originTrackId, curves.origin).catch(() => {});
+        await host.setTrackVolumeAutomation(targetTrackId, curves.target).catch(() => {});
+      } else {
+        await host.setTrackVolume(originTrackId, EQUAL_POWER_GAIN).catch(() => {});
+        await host.setTrackVolume(targetTrackId, EQUAL_POWER_GAIN).catch(() => {});
+      }
+    },
+    [host],
+  );
+
   // --- Create a crossfade pair (transition scenes) ----------------------
   // Two tracks share ONE generated MIDI clip: the top wears the ORIGIN scene
   // track's preset, the bottom wears the TARGET's. The user can't
@@ -779,10 +796,11 @@ export function SynthGeneratorPanel({
         const originLabel = await copyPreset(top.id, origin.dbId);
         const targetLabel = await copyPreset(bottom.id, target.dbId);
 
-        // 5. Equal-power center so the centered (non-functional) slider already
-        // sounds like a midpoint blend. Leave unmuted — the point is to hear it.
-        await host.setTrackVolume(top.id, EQUAL_POWER_GAIN).catch(() => {});
-        await host.setTrackVolume(bottom.id, EQUAL_POWER_GAIN).catch(() => {});
+        // 5. Apply the crossfade volume automation: origin fades out, target
+        // fades in across the loop (equal-power, crossover at the centered
+        // slider). Falls back to a static equal-power blend on hosts without
+        // automation. Leave unmuted — the point is to hear it.
+        await applyCrossfadeAutomation(top.id, bottom.id, mc.bars, mc.bpm, 0.5);
 
         // 6. Persist the pairing (one key per member, shared groupId).
         const groupId = top.dbId;
@@ -809,7 +827,7 @@ export function SynthGeneratorPanel({
         setIsCreatingCrossfade(false);
       }
     },
-    [host, activeSceneId, isConnected, isAuthenticated, tracks.length, sceneContext, applySynthSound, loadTracks],
+    [host, activeSceneId, isConnected, isAuthenticated, tracks.length, sceneContext, applySynthSound, applyCrossfadeAutomation, loadTracks],
   );
 
   // --- Export tracks as MIDI bundle -------------------------------------
@@ -975,6 +993,27 @@ export function SynthGeneratorPanel({
       host.showToast('error', 'Failed to delete crossfade', err instanceof Error ? err.message : String(err));
     }
   }, [host, activeSceneId]);
+
+  // Drag the crossfade fader: optimistic UI now, debounced engine apply + persist
+  // of sliderPos (recomputes the equal-power curves at the new crossover point).
+  const crossfadeSliderTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const handleCrossfadeSlider = useCallback((pair: ResolvedCrossfadePair, pos: number): void => {
+    setCrossfadePairsMeta(prev => prev.map(p => (p.groupId === pair.groupId ? { ...p, sliderPos: pos } : p)));
+    if (crossfadeSliderTimers.current[pair.groupId]) clearTimeout(crossfadeSliderTimers.current[pair.groupId]);
+    crossfadeSliderTimers.current[pair.groupId] = setTimeout(() => {
+      void (async () => {
+        const mc = await host.getMusicalContext();
+        await applyCrossfadeAutomation(pair.origin.handle.id, pair.target.handle.id, mc.bars, mc.bpm, pos);
+        if (activeSceneId) {
+          const sceneData = (await host.getAllSceneData(activeSceneId)) as Record<string, unknown>;
+          for (const dbId of [pair.originDbId, pair.targetDbId]) {
+            const meta = asCrossfadeMeta(sceneData[`track:${dbId}:crossfade`]);
+            if (meta) host.setSceneData(activeSceneId, `track:${dbId}:crossfade`, { ...meta, sliderPos: pos }).catch(() => {});
+          }
+        }
+      })();
+    }, 200);
+  }, [host, activeSceneId, applyCrossfadeAutomation]);
 
   // --- Update prompt (debounced save) -----------------------------------
   const handlePromptChange = useCallback((trackId: string, prompt: string): void => {
@@ -1723,6 +1762,7 @@ export function SynthGeneratorPanel({
               onPanChange={(slot: CrossfadeSlot, pan: number) =>
                 handlePanChange(slot === 'origin' ? pair.origin.handle.id : pair.target.handle.id, pan)
               }
+              onSliderChange={(pos: number) => handleCrossfadeSlider(pair, pos)}
               onDelete={() => handleCrossfadeDelete(pair)}
             />
           ))}
