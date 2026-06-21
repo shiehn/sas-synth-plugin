@@ -728,7 +728,7 @@ export function SynthGeneratorPanel({
       setIsCreatingCrossfade(true);
       const created: PluginTrackHandle[] = [];
       try {
-        const role = origin.role ?? target.role ?? '';
+        const role = target.role ?? origin.role ?? ''; // bridge heads toward the target
 
         // 1. Generate ONE bridge clip via MIDI INPAINTING: morph the ORIGIN part
         // into the TARGET part across the transition. The harmonic frame
@@ -1724,6 +1724,7 @@ export function SynthGeneratorPanel({
           fromSceneId={xfFromId}
           toSceneId={xfToId}
           onClose={() => setCrossfadeOpen(false)}
+          excludeSourceDbIds={crossfadePairsMeta.flatMap((p) => [p.originSourceDbId, p.targetSourceDbId])}
           onCreate={handleCreateCrossfade}
           testIdPrefix="synth-crossfade"
         />
