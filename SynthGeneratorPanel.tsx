@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, FadeModal, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
 
 // ============================================================================
 // Constants
@@ -116,6 +116,11 @@ interface ResolvedCrossfadePair extends CrossfadePairMeta {
   target: SynthTrackState;
 }
 
+/** A fade (transition orphan) resolved against live track state. */
+interface ResolvedFade extends FadeEntry {
+  track: SynthTrackState;
+}
+
 // ============================================================================
 // SynthGeneratorPanel
 // ============================================================================
@@ -149,6 +154,14 @@ export function SynthGeneratorPanel({
   // scene-data; the render layer groups them into one CrossfadeTrackRow).
   const [crossfadeOpen, setCrossfadeOpen] = useState(false);
   const [crossfadePairsMeta, setCrossfadePairsMeta] = useState<CrossfadePairMeta[]>([]);
+  // Fade tracks (transition scenes): the "+ Fade" modal + parsed fade metadata
+  // for the active scene. A fade is a crossfade with one empty endpoint — a lone
+  // track that fades in (target-only) or out (origin-only) across the transition.
+  const [fadeOpen, setFadeOpen] = useState(false);
+  const [fadesMeta, setFadesMeta] = useState<FadeEntry[]>([]);
+  // Engine track ids whose fade volume curve has been applied this session
+  // (keyed by engine id so reopen → new ids re-applies; curve isn't engine-persisted).
+  const appliedFadeAutomationRef = useRef<Set<string>>(new Set());
   // Scene-keyed compose state: preserved when switching scenes via SDK hook
   const [isComposing, , setIsComposingForScene] = useSceneState(activeSceneId, false);
   const [placeholders, , setPlaceholdersForScene] = useSceneState<BulkAddPlaceholderTrack[]>(activeSceneId, EMPTY_PLACEHOLDERS);
@@ -283,6 +296,7 @@ export function SynthGeneratorPanel({
     if (!sceneAtStart) {
       setTracks([]);
       setCrossfadePairsMeta([]);
+      setFadesMeta([]);
       tracksLoadedForSceneRef.current = null;
       // No scene → nothing to load → not loading. Without this, a load that
       // had already set isLoadingTracks=true (line below) and is then
@@ -441,7 +455,10 @@ export function SynthGeneratorPanel({
       // Group crossfade members (normal tracks linked by a shared groupId in
       // scene-data) into pairs. Members render as one CrossfadeTrackRow; the
       // render layer excludes their standalone rows.
-      if (!isStale()) setCrossfadePairsMeta(parseCrossfadePairs(sceneData));
+      if (!isStale()) {
+        setCrossfadePairsMeta(parseCrossfadePairs(sceneData));
+        setFadesMeta(parseFades(sceneData));
+      }
     } catch (error: unknown) {
       console.error('[SynthGeneratorPanel] Failed to load tracks:', error);
     } finally {
@@ -707,6 +724,26 @@ export function SynthGeneratorPanel({
     [host],
   );
 
+  // Apply a fade's one-sided volume curve (volume gesture ramps; build stays flat
+  // at unity so the notes carry the fade). No-op on hosts without automation —
+  // the track simply plays at unity (acceptable degradation; a fade is dynamic
+  // and has no sensible static fallback).
+  const applyFadeAutomation = useCallback(
+    async (
+      trackId: string,
+      direction: FadeDirection,
+      bars: number,
+      bpm: number,
+      sliderPos: number,
+      gesture: FadeGesture,
+    ): Promise<void> => {
+      if (!host.setTrackVolumeAutomation) return;
+      const points = buildFadeVolumeCurve(bars, bpm, direction, sliderPos, gesture);
+      await host.setTrackVolumeAutomation(trackId, points).catch(() => {});
+    },
+    [host],
+  );
+
   // --- Create a crossfade pair (transition scenes) ----------------------
   // Two tracks share ONE generated MIDI clip: the top wears the ORIGIN scene
   // track's preset, the bottom wears the TARGET's. The user can't
@@ -830,6 +867,112 @@ export function SynthGeneratorPanel({
     [host, activeSceneId, isConnected, isAuthenticated, tracks.length, sceneContext, applySynthSound, applyCrossfadeAutomation, loadTracks],
   );
 
+  // --- Create a fade (transition orphan) --------------------------------
+  // A fade is a crossfade with one empty endpoint: ONE generated track that
+  // either fades in (target-only) or out (origin-only) across the transition.
+  // The part is inpainted with the source on the populated endpoint and ∅ on the
+  // other (grows in / dissolves out); the sound is copied from the source; the
+  // gesture (chosen by role in the modal) sets the volume-curve depth. LIFO
+  // rollback on failure; throws so the modal surfaces it.
+  const [isCreatingFade, setIsCreatingFade] = useState(false);
+  const handleCreateFade = useCallback(
+    async (selection: FadeSelection, direction: FadeDirection, gesture: FadeGesture): Promise<void> => {
+      const scene = activeSceneId;
+      const fromSceneId = sceneContext?.transitionFromSceneId ?? '';
+      const toSceneId = sceneContext?.transitionToSceneId ?? '';
+      if (!scene) throw new Error('No active scene.');
+      if (!isConnected) throw new Error('Systems not connected.');
+      if (!isAuthenticated) throw new Error('Please sign in to generate the fade.');
+      if (tracks.length + 1 > MAX_TRACKS) throw new Error('Not enough track slots for a fade.');
+
+      setIsCreatingFade(true);
+      const created: PluginTrackHandle[] = [];
+      try {
+        const role = selection.role ?? '';
+        // The source lives in the FROM scene for a fade-out, the TO scene for a fade-in.
+        const sourceSceneId = direction === 'out' ? fromSceneId : toSceneId;
+
+        // 1. Generate the part via inpainting with ONE empty endpoint: a fade-in
+        // grows from ∅ into the source pattern; a fade-out dissolves from the
+        // source toward ∅. The harmonic frame is auto-prefixed by generateWithLLM.
+        const mc = await host.getMusicalContext();
+        const [srcMidi, srcKey] = await Promise.all([
+          host.readImportableTrackMidi ? host.readImportableTrackMidi(selection.dbId) : Promise.resolve({ clips: [] }),
+          host.getSceneKey ? host.getSceneKey(sourceSceneId) : Promise.resolve(null),
+        ]);
+        const srcNotes = srcMidi.clips[0]?.notes ?? [];
+        const keyStr = srcKey ? `${srcKey.key} ${srcKey.mode}` : null;
+        const userPrompt = buildCrossfadeInpaintPrompt({
+          role,
+          bars: mc.bars,
+          originName: direction === 'out' ? selection.name : 'silence',
+          targetName: direction === 'in' ? selection.name : 'silence',
+          originKey: direction === 'out' ? keyStr : null,
+          targetKey: direction === 'in' ? keyStr : null,
+          originNotes: direction === 'out' ? srcNotes : [],
+          targetNotes: direction === 'in' ? srcNotes : [],
+        });
+        const llm = await host.generateWithLLM({
+          system: buildMidiSystemPrompt(host.getValidRoles()),
+          user: userPrompt,
+          responseFormat: 'json',
+        });
+        const parsed = parseLLMNoteResponse(llm.content);
+        if (!parsed || parsed.notes.length === 0) {
+          throw new Error('The fade generator returned no notes.');
+        }
+        const notes = await host.postProcessMidi(parsed.notes, { quantize: true, removeOverlaps: true });
+        const clip: MidiClipData = { startTime: 0, endTime: (mc.bars * 4 * 60) / mc.bpm, tempo: mc.bpm, notes };
+
+        // 2. Create ONE track (default Surge; preset copied below).
+        const track = await host.createTrack({ name: `synth-${Date.now()}-fade-${direction}`, loadSynth: true, synthName: 'Surge XT' });
+        created.push(track);
+        if (role) await host.setTrackRole(track.id, role).catch(() => {});
+
+        // 3. MIDI.
+        await host.writeMidiClip(track.id, clip);
+
+        // 4. Copy the source preset (exact sound — no shuffle).
+        let soundLabel = 'default';
+        if (host.getTrackSound) {
+          const snap = await host.getTrackSound(selection.dbId);
+          if (snap && snap.kind === 'preset') {
+            await applySynthSound(track.id, { state: snap.state, stateType: snap.stateType });
+            soundLabel = snap.label;
+          }
+        }
+
+        // 5. One-sided volume curve (centered slider). Mark applied so the load
+        // effect doesn't redundantly re-apply.
+        await applyFadeAutomation(track.id, direction, mc.bars, mc.bpm, 0.5, gesture);
+        appliedFadeAutomationRef.current.add(track.id);
+
+        // 6. Persist the fade metadata (one key for the lone track).
+        const meta: FadeMeta = {
+          direction,
+          gesture,
+          sourceTrackDbId: selection.dbId,
+          sourceSceneId,
+          sourceName: selection.name,
+          soundLabel,
+          sliderPos: 0.5,
+        };
+        await host.setSceneData(scene, `track:${track.dbId}:fade`, meta);
+
+        await loadTracks(true);
+        host.showToast('success', direction === 'in' ? 'Fade in created' : 'Fade out created', selection.name);
+      } catch (err: unknown) {
+        for (const h of [...created].reverse()) {
+          try { await host.deleteTrack(h.id); } catch { /* best effort */ }
+        }
+        throw err instanceof Error ? err : new Error(String(err));
+      } finally {
+        setIsCreatingFade(false);
+      }
+    },
+    [host, activeSceneId, isConnected, isAuthenticated, tracks.length, sceneContext, applySynthSound, applyFadeAutomation, loadTracks],
+  );
+
   // --- Export tracks as MIDI bundle -------------------------------------
   const [isExportingMidi, setIsExportingMidi] = useState(false);
   const handleExportMidi = useCallback(async (): Promise<void> => {
@@ -930,11 +1073,31 @@ export function SynthGeneratorPanel({
             + Crossfade
           </button>
         )}
+        {canCrossfade && (
+          <button
+            data-testid="add-fade-button"
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              if (needsContract) { onOpenContract?.(); return; }
+              onExpandSelf?.();
+              setFadeOpen(true);
+            }}
+            disabled={!activeSceneId || needsContract || isCreatingFade || tracks.length + 1 > MAX_TRACKS}
+            className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
+              !activeSceneId || needsContract || isCreatingFade || tracks.length + 1 > MAX_TRACKS
+                ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
+                : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
+            }`}
+            title="Fade an orphan track in or out across this transition"
+          >
+            + Fade
+          </button>
+        )}
       </div>
     );
     return () => { onHeaderContent(null); };
   }, [onHeaderContent, needsContract, isConnected, activeSceneId, tracks.length, isAddingTrack,
-      handleAddTrack, onOpenContract, host, canCrossfade, isCreatingCrossfade, onExpandSelf]);
+      handleAddTrack, onOpenContract, host, canCrossfade, isCreatingCrossfade, isCreatingFade, onExpandSelf]);
 
   // --- Push loading state to accordion header ---------------------------
   useEffect(() => {
@@ -1014,6 +1177,40 @@ export function SynthGeneratorPanel({
       })();
     }, 200);
   }, [host, activeSceneId, applyCrossfadeAutomation]);
+
+  // --- Fade controls ----------------------------------------------------
+  // A fade is a single normal track, so mute/solo/volume/pan reuse the normal
+  // per-track handlers. Only delete + the fade slider are fade-specific.
+  const handleFadeDelete = useCallback(async (fade: ResolvedFade): Promise<void> => {
+    try {
+      await host.deleteTrack(fade.track.handle.id);
+      if (activeSceneId) await host.deleteSceneData(activeSceneId, `track:${fade.dbId}:fade`);
+      setFadesMeta(prev => prev.filter(f => f.dbId !== fade.dbId));
+      setTracks(prev => prev.filter(t => t.handle.id !== fade.track.handle.id));
+      host.showToast('success', 'Fade removed');
+    } catch (err: unknown) {
+      host.showToast('error', 'Failed to delete fade', err instanceof Error ? err.message : String(err));
+    }
+  }, [host, activeSceneId]);
+
+  // Drag the fade slider: optimistic UI now, debounced engine apply + persist of
+  // sliderPos (recomputes the one-sided curve at the new fade position).
+  const fadeSliderTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const handleFadeSlider = useCallback((fade: ResolvedFade, pos: number): void => {
+    setFadesMeta(prev => prev.map(f => (f.dbId === fade.dbId ? { ...f, meta: { ...f.meta, sliderPos: pos } } : f)));
+    if (fadeSliderTimers.current[fade.dbId]) clearTimeout(fadeSliderTimers.current[fade.dbId]);
+    fadeSliderTimers.current[fade.dbId] = setTimeout(() => {
+      void (async () => {
+        const mc = await host.getMusicalContext();
+        await applyFadeAutomation(fade.track.handle.id, fade.meta.direction, mc.bars, mc.bpm, pos, fade.meta.gesture);
+        if (activeSceneId) {
+          const sceneData = (await host.getAllSceneData(activeSceneId)) as Record<string, unknown>;
+          const meta = asFadeMeta(sceneData[`track:${fade.dbId}:fade`]);
+          if (meta) host.setSceneData(activeSceneId, `track:${fade.dbId}:fade`, { ...meta, sliderPos: pos }).catch(() => {});
+        }
+      })();
+    }, 200);
+  }, [host, activeSceneId, applyFadeAutomation]);
 
   // --- Update prompt (debounced save) -----------------------------------
   const handlePromptChange = useCallback((trackId: string, prompt: string): void => {
@@ -1551,6 +1748,36 @@ export function SynthGeneratorPanel({
     return { resolvedCrossfadePairs: pairs, crossfadeMemberDbIds: members };
   }, [tracks, crossfadePairsMeta]);
 
+  // Resolve fades against live track state. The member renders as one
+  // FadeTrackRow and is excluded from the normal list; a fade whose track is
+  // gone (deleted out-of-band) is dropped.
+  const { resolvedFades, fadeMemberDbIds } = useMemo(() => {
+    const byDbId = new Map(tracks.map((t) => [t.handle.dbId, t]));
+    const list: ResolvedFade[] = [];
+    const members = new Set<string>();
+    for (const f of fadesMeta) {
+      const track = byDbId.get(f.dbId);
+      if (track) { list.push({ ...f, track }); members.add(f.dbId); }
+    }
+    return { resolvedFades: list, fadeMemberDbIds: members };
+  }, [tracks, fadesMeta]);
+
+  // Re-apply each fade's one-sided volume curve on load (it is NOT engine-
+  // persisted; recompute from the persisted sliderPos + gesture). Keyed by engine
+  // track id so it fires once per resolve — including after reopen (new ids).
+  useEffect(() => {
+    if (!host.setTrackVolumeAutomation || resolvedFades.length === 0) return;
+    void (async () => {
+      const mc = await host.getMusicalContext();
+      for (const fade of resolvedFades) {
+        const id = fade.track.handle.id;
+        if (appliedFadeAutomationRef.current.has(id)) continue;
+        appliedFadeAutomationRef.current.add(id);
+        await applyFadeAutomation(id, fade.meta.direction, mc.bars, mc.bpm, fade.meta.sliderPos, fade.meta.gesture);
+      }
+    })();
+  }, [resolvedFades, host, applyFadeAutomation]);
+
   // --- Render -----------------------------------------------------------
 
   // No scene selected
@@ -1724,9 +1951,27 @@ export function SynthGeneratorPanel({
           fromSceneId={xfFromId}
           toSceneId={xfToId}
           onClose={() => setCrossfadeOpen(false)}
-          excludeSourceDbIds={crossfadePairsMeta.flatMap((p) => [p.originSourceDbId, p.targetSourceDbId])}
+          excludeSourceDbIds={[
+            ...crossfadePairsMeta.flatMap((p) => [p.originSourceDbId, p.targetSourceDbId]),
+            ...fadesMeta.map((f) => f.meta.sourceTrackDbId),
+          ]}
           onCreate={handleCreateCrossfade}
           testIdPrefix="synth-crossfade"
+        />
+      )}
+      {canCrossfade && xfFromId && xfToId && (
+        <FadeModal
+          host={host}
+          open={fadeOpen}
+          fromSceneId={xfFromId}
+          toSceneId={xfToId}
+          onClose={() => setFadeOpen(false)}
+          excludeSourceDbIds={[
+            ...crossfadePairsMeta.flatMap((p) => [p.originSourceDbId, p.targetSourceDbId]),
+            ...fadesMeta.map((f) => f.meta.sourceTrackDbId),
+          ]}
+          onCreate={handleCreateFade}
+          testIdPrefix="synth-fade"
         />
       )}
       {isLoadingTracks ? (
@@ -1767,8 +2012,32 @@ export function SynthGeneratorPanel({
               onDelete={() => handleCrossfadeDelete(pair)}
             />
           ))}
+          {resolvedFades.map((fade) => (
+            <FadeTrackRow
+              key={fade.dbId}
+              accentColor="#9333EA"
+              levels={supportsMeters ? trackLevels : undefined}
+              direction={fade.meta.direction}
+              gesture={fade.meta.gesture}
+              sliderPos={fade.meta.sliderPos}
+              layer={{
+                trackId: fade.track.handle.id,
+                name: fade.track.handle.name,
+                role: fade.track.role,
+                sourceName: fade.meta.sourceName,
+                soundLabel: fade.meta.soundLabel,
+                runtimeState: fade.track.runtimeState,
+              }}
+              onMuteToggle={() => handleMuteToggle(fade.track.handle.id)}
+              onSoloToggle={() => handleSoloToggle(fade.track.handle.id)}
+              onVolumeChange={(vol: number) => handleVolumeChange(fade.track.handle.id, vol)}
+              onPanChange={(pan: number) => handlePanChange(fade.track.handle.id, pan)}
+              onSliderChange={(pos: number) => handleFadeSlider(fade, pos)}
+              onDelete={() => handleFadeDelete(fade)}
+            />
+          ))}
           {tracks.map((track: SynthTrackState, index: number) => {
-            if (crossfadeMemberDbIds.has(track.handle.dbId)) return null;
+            if (crossfadeMemberDbIds.has(track.handle.dbId) || fadeMemberDbIds.has(track.handle.dbId)) return null;
             return (
           <TrackRow
             key={track.handle.id}
