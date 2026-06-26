@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, soundIdentity, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
 
 // ============================================================================
 // Constants
@@ -1772,6 +1772,37 @@ export function SynthGeneratorPanel({
     }
     return { resolvedFades: list, fadeMemberDbIds: members };
   }, [tracks, fadesMeta]);
+
+  // Auto re-sync drifted source presets. A crossfade/fade COPIES each source's
+  // preset onto its layer at creation; if the user later changes the source
+  // track's preset, the transition is stale. On every load (mount / scene change
+  // / agent mutation), re-read source + layer sounds and, if the source's
+  // state-aware identity differs, re-copy it onto the layer (the layer is locked,
+  // so divergence == the source drifted). Keyed by engine id; cheap when in sync.
+  useEffect(() => {
+    if (!host.getTrackSound || (resolvedCrossfadePairs.length === 0 && resolvedFades.length === 0)) return;
+    let cancelled = false;
+    const reapplyIfDrifted = async (layerTrackId: string, layerDbId: string, sourceDbId: string): Promise<void> => {
+      if (!host.getTrackSound || cancelled) return;
+      const [sourceSnap, layerSnap] = await Promise.all([
+        host.getTrackSound(sourceDbId),
+        host.getTrackSound(layerDbId),
+      ]);
+      if (cancelled || !sourceSnap || sourceSnap.kind !== 'preset') return;
+      if (soundIdentity(sourceSnap) === soundIdentity(layerSnap)) return;
+      await applySynthSound(layerTrackId, { state: sourceSnap.state, stateType: sourceSnap.stateType }).catch(() => {});
+    };
+    void (async () => {
+      for (const pair of resolvedCrossfadePairs) {
+        await reapplyIfDrifted(pair.origin.handle.id, pair.origin.handle.dbId, pair.originSourceDbId);
+        await reapplyIfDrifted(pair.target.handle.id, pair.target.handle.dbId, pair.targetSourceDbId);
+      }
+      for (const fade of resolvedFades) {
+        await reapplyIfDrifted(fade.track.handle.id, fade.track.handle.dbId, fade.meta.sourceTrackDbId);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [resolvedCrossfadePairs, resolvedFades, host, applySynthSound]);
 
   // Re-apply each fade's one-sided volume curve on load (it is NOT engine-
   // persisted; recompute from the persisted sliderPos + gesture). Keyed by engine
