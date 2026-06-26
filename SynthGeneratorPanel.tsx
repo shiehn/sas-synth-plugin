@@ -153,7 +153,7 @@ export function SynthGeneratorPanel({
   // replaces the per-pair "+ Crossfade"/"+ Fade" modals, plus the parsed pair +
   // fade metadata for the active scene (members are normal tracks linked via
   // scene-data; the render layer groups them into CrossfadeTrackRow/FadeTrackRow).
-  const [designerOpen, setDesignerOpen] = useState(false);
+  const [designerView, setDesignerView] = useState(false);
   const [crossfadePairsMeta, setCrossfadePairsMeta] = useState<CrossfadePairMeta[]>([]);
   // A fade is a crossfade with one empty endpoint — a lone track that fades in
   // (target-only) or out (origin-only) across the transition.
@@ -1008,6 +1008,10 @@ export function SynthGeneratorPanel({
   const xfToId = sceneContext?.transitionToSceneId ?? null;
   const canCrossfade =
     sceneContext?.sceneType === 'transition' && !!xfFromId && !!xfToId && !!host.listSceneFamilyTracks;
+  // Leaving a transition scene drops back to the Tracks view (the toggle is hidden).
+  useEffect(() => {
+    if (!canCrossfade) setDesignerView(false);
+  }, [canCrossfade]);
   useEffect(() => {
     if (!onHeaderContent) return;
     const addDisabled =
@@ -1018,8 +1022,8 @@ export function SynthGeneratorPanel({
       isAddingTrack;
 
     onHeaderContent(
-      <div className="flex gap-1">
-        {host.listImportableTracks && (
+      <div className="flex gap-1 items-center">
+        {(!canCrossfade || !designerView) && host.listImportableTracks && (
           <button
             data-testid="import-from-scene-synth-button"
             onClick={(e: React.MouseEvent) => {
@@ -1037,46 +1041,64 @@ export function SynthGeneratorPanel({
             Import Track
           </button>
         )}
-        <button
-          data-testid="add-synth-track-button"
-          onClick={(e: React.MouseEvent) => {
-            e.stopPropagation();
-            if (needsContract) { onOpenContract?.(); return; }
-            handleAddTrack();
-          }}
-          className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
-            addDisabled
-              ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
-              : 'bg-sas-accent/10 border-sas-accent/30 text-sas-accent hover:bg-sas-accent/20'
-          }`}
-        >
-          Add Track
-        </button>
-        {canCrossfade && (
+        {(!canCrossfade || !designerView) && (
           <button
-            data-testid="open-transition-designer-button"
+            data-testid="add-synth-track-button"
             onClick={(e: React.MouseEvent) => {
               e.stopPropagation();
               if (needsContract) { onOpenContract?.(); return; }
-              onExpandSelf?.();
-              setDesignerOpen(true);
+              handleAddTrack();
             }}
-            disabled={!activeSceneId || needsContract || isCreatingCrossfade || isCreatingFade}
             className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
-              !activeSceneId || needsContract || isCreatingCrossfade || isCreatingFade
+              addDisabled
                 ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
-                : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
+                : 'bg-sas-accent/10 border-sas-accent/30 text-sas-accent hover:bg-sas-accent/20'
             }`}
-            title="Arrange crossfades & fades between the two scenes"
           >
-            Transition Designer
+            Add Track
           </button>
+        )}
+        {canCrossfade && (
+          <div
+            className="flex items-center rounded-sm border border-sas-border overflow-hidden"
+            data-testid="synth-view-toggle"
+          >
+            <button
+              data-testid="synth-view-tracks"
+              onClick={(e: React.MouseEvent) => { e.stopPropagation(); setDesignerView(false); }}
+              className={`px-2 py-0.5 text-[10px] font-medium transition-colors ${
+                !designerView
+                  ? 'bg-sas-accent text-sas-bg'
+                  : 'bg-sas-panel-alt text-sas-muted hover:text-sas-accent'
+              }`}
+            >
+              Tracks
+            </button>
+            <button
+              data-testid="synth-view-transition"
+              onClick={(e: React.MouseEvent) => {
+                e.stopPropagation();
+                if (needsContract) { onOpenContract?.(); return; }
+                onExpandSelf?.();
+                setDesignerView(true);
+              }}
+              disabled={needsContract}
+              className={`px-2 py-0.5 text-[10px] font-medium transition-colors disabled:opacity-50 ${
+                designerView
+                  ? 'bg-sas-accent text-sas-bg'
+                  : 'bg-sas-panel-alt text-sas-muted hover:text-sas-accent'
+              }`}
+              title="Arrange crossfades & fades between the two scenes"
+            >
+              Transition
+            </button>
+          </div>
         )}
       </div>
     );
     return () => { onHeaderContent(null); };
   }, [onHeaderContent, needsContract, isConnected, activeSceneId, tracks.length, isAddingTrack,
-      handleAddTrack, onOpenContract, host, canCrossfade, isCreatingCrossfade, isCreatingFade, onExpandSelf]);
+      handleAddTrack, onOpenContract, host, canCrossfade, designerView, onExpandSelf]);
 
   // --- Push loading state to accordion header ---------------------------
   useEffect(() => {
@@ -1923,14 +1945,12 @@ export function SynthGeneratorPanel({
           testIdPrefix="synth-sound-import"
         />
       )}
-      {canCrossfade && xfFromId && xfToId && (
+      {designerView && canCrossfade && xfFromId && xfToId ? (
         <TransitionDesigner
           host={host}
-          open={designerOpen}
           fromSceneId={xfFromId}
           toSceneId={xfToId}
           transitionSceneId={activeSceneId ?? ''}
-          onClose={() => setDesignerOpen(false)}
           excludeSourceDbIds={[
             ...crossfadePairsMeta.flatMap((p) => [p.originSourceDbId, p.targetSourceDbId]),
             ...fadesMeta.map((f) => f.meta.sourceTrackDbId),
@@ -1940,8 +1960,7 @@ export function SynthGeneratorPanel({
           familyLabel="Synths"
           testIdPrefix="synth-transition-designer"
         />
-      )}
-      {isLoadingTracks ? (
+      ) : isLoadingTracks ? (
         <div className="text-sas-muted text-xs text-center py-4">Loading tracks...</div>
       ) : (
         <>
