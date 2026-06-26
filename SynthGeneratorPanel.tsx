@@ -22,7 +22,7 @@ import type {
   FxCategory,
   TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, CrossfadeModal, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, FadeModal, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow, type DrawerTab, useSceneState, useAnySolo, useSoundHistory, useTrackReorder, type TrackSoundHistory, SorceryProgressBar, EMPTY_FX_DETAIL_STATE, formatConcurrentTracks, ImportTrackModal, useTrackLevels, CrossfadeTrackRow, TransitionDesigner, EQUAL_POWER_GAIN, parseCrossfadePairs, asCrossfadeMeta, buildCrossfadeInpaintPrompt, buildCrossfadeVolumeCurves, type CrossfadeSlot, type CrossfadeSelection, type CrossfadeMeta, type CrossfadePairMeta, FadeTrackRow, parseFades, asFadeMeta, buildFadeVolumeCurve, type FadeDirection, type FadeGesture, type FadeMeta, type FadeEntry, type FadeSelection } from '@signalsandsorcery/plugin-sdk';
 
 // ============================================================================
 // Constants
@@ -149,15 +149,14 @@ export function SynthGeneratorPanel({
   const [isLoadingTracks, setIsLoadingTracks] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [soundImportTarget, setSoundImportTarget] = useState<SynthTrackState | null>(null);
-  // Crossfade tracks (transition scenes): the "+ Crossfade" modal + the parsed
-  // pair metadata for the active scene (members are normal tracks linked via
-  // scene-data; the render layer groups them into one CrossfadeTrackRow).
-  const [crossfadeOpen, setCrossfadeOpen] = useState(false);
+  // Transition Designer (transition scenes): the single staging board that
+  // replaces the per-pair "+ Crossfade"/"+ Fade" modals, plus the parsed pair +
+  // fade metadata for the active scene (members are normal tracks linked via
+  // scene-data; the render layer groups them into CrossfadeTrackRow/FadeTrackRow).
+  const [designerOpen, setDesignerOpen] = useState(false);
   const [crossfadePairsMeta, setCrossfadePairsMeta] = useState<CrossfadePairMeta[]>([]);
-  // Fade tracks (transition scenes): the "+ Fade" modal + parsed fade metadata
-  // for the active scene. A fade is a crossfade with one empty endpoint — a lone
-  // track that fades in (target-only) or out (origin-only) across the transition.
-  const [fadeOpen, setFadeOpen] = useState(false);
+  // A fade is a crossfade with one empty endpoint — a lone track that fades in
+  // (target-only) or out (origin-only) across the transition.
   const [fadesMeta, setFadesMeta] = useState<FadeEntry[]>([]);
   // Engine track ids whose fade volume curve has been applied this session
   // (keyed by engine id so reopen → new ids re-applies; curve isn't engine-persisted).
@@ -1055,42 +1054,22 @@ export function SynthGeneratorPanel({
         </button>
         {canCrossfade && (
           <button
-            data-testid="add-crossfade-button"
+            data-testid="open-transition-designer-button"
             onClick={(e: React.MouseEvent) => {
               e.stopPropagation();
               if (needsContract) { onOpenContract?.(); return; }
               onExpandSelf?.();
-              setCrossfadeOpen(true);
+              setDesignerOpen(true);
             }}
-            disabled={!activeSceneId || needsContract || isCreatingCrossfade || tracks.length + 2 > MAX_TRACKS}
+            disabled={!activeSceneId || needsContract || isCreatingCrossfade || isCreatingFade}
             className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
-              !activeSceneId || needsContract || isCreatingCrossfade || tracks.length + 2 > MAX_TRACKS
+              !activeSceneId || needsContract || isCreatingCrossfade || isCreatingFade
                 ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
                 : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
             }`}
-            title="Crossfade an origin track into a target track over this transition"
+            title="Arrange crossfades & fades between the two scenes"
           >
-            + Crossfade
-          </button>
-        )}
-        {canCrossfade && (
-          <button
-            data-testid="add-fade-button"
-            onClick={(e: React.MouseEvent) => {
-              e.stopPropagation();
-              if (needsContract) { onOpenContract?.(); return; }
-              onExpandSelf?.();
-              setFadeOpen(true);
-            }}
-            disabled={!activeSceneId || needsContract || isCreatingFade || tracks.length + 1 > MAX_TRACKS}
-            className={`px-2 py-0.5 text-[10px] font-medium rounded-sm border transition-colors ${
-              !activeSceneId || needsContract || isCreatingFade || tracks.length + 1 > MAX_TRACKS
-                ? 'bg-sas-panel border-sas-border text-sas-muted/50 cursor-not-allowed'
-                : 'bg-sas-panel-alt border-sas-border text-sas-muted hover:border-sas-accent hover:text-sas-accent'
-            }`}
-            title="Fade an orphan track in or out across this transition"
-          >
-            + Fade
+            Transition Designer
           </button>
         )}
       </div>
@@ -1945,33 +1924,21 @@ export function SynthGeneratorPanel({
         />
       )}
       {canCrossfade && xfFromId && xfToId && (
-        <CrossfadeModal
+        <TransitionDesigner
           host={host}
-          open={crossfadeOpen}
+          open={designerOpen}
           fromSceneId={xfFromId}
           toSceneId={xfToId}
-          onClose={() => setCrossfadeOpen(false)}
+          transitionSceneId={activeSceneId ?? ''}
+          onClose={() => setDesignerOpen(false)}
           excludeSourceDbIds={[
             ...crossfadePairsMeta.flatMap((p) => [p.originSourceDbId, p.targetSourceDbId]),
             ...fadesMeta.map((f) => f.meta.sourceTrackDbId),
           ]}
-          onCreate={handleCreateCrossfade}
-          testIdPrefix="synth-crossfade"
-        />
-      )}
-      {canCrossfade && xfFromId && xfToId && (
-        <FadeModal
-          host={host}
-          open={fadeOpen}
-          fromSceneId={xfFromId}
-          toSceneId={xfToId}
-          onClose={() => setFadeOpen(false)}
-          excludeSourceDbIds={[
-            ...crossfadePairsMeta.flatMap((p) => [p.originSourceDbId, p.targetSourceDbId]),
-            ...fadesMeta.map((f) => f.meta.sourceTrackDbId),
-          ]}
-          onCreate={handleCreateFade}
-          testIdPrefix="synth-fade"
+          onCreateCrossfade={handleCreateCrossfade}
+          onCreateFade={handleCreateFade}
+          familyLabel="Synths"
+          testIdPrefix="synth-transition-designer"
         />
       )}
       {isLoadingTracks ? (
