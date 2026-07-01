@@ -136,14 +136,17 @@ export function SynthGeneratorPanel({
   onSelectScene,
   onOpenContract,
   onExpandSelf,
+  isExpanded,
 }: PluginUIProps): React.ReactElement {
-  // Cosmetic per-track peak meters. Poll while the panel is mounted + visible;
-  // NOT gated on transport state (this app plays via decks/clip-launcher, so the
-  // linear "is playing" flag is unreliable). Stopped tracks just read the floor.
-  // The host coalesces the read so playback always wins over the GUI. Older
-  // hosts (no getTrackLevels) degrade to no meter via the `supportsMeters` guard.
+  // Cosmetic per-track peak meters. Poll ONLY while this panel is expanded
+  // (`isExpanded`): collapsed panels stay mounted, so without this gate every
+  // hidden panel keeps polling at ~30Hz — and the accordion only ever expands
+  // one. NOT gated on transport state (this app plays via decks/clip-launcher,
+  // so the linear "is playing" flag is unreliable). Stopped tracks just read the
+  // floor. The host coalesces the read so playback always wins over the GUI.
+  // Older hosts (no getTrackLevels) degrade to no meter via `supportsMeters`.
   const supportsMeters = typeof host.getTrackLevels === 'function';
-  const trackLevels = useTrackLevels(host);
+  const trackLevels = useTrackLevels(host, isExpanded);
 
   const [tracks, setTracks] = useState<SynthTrackState[]>([]);
   const [isLoadingTracks, setIsLoadingTracks] = useState(false);
