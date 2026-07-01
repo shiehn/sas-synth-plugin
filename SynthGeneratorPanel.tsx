@@ -828,11 +828,16 @@ export function SynthGeneratorPanel({
         await host.writeMidiClip(bottom.id, clip);
 
         // 4. Copy each source preset onto its layer (exact sound — no shuffle).
+        // Persist the copy as the layer's preset_state: that is the layer's only
+        // durable identity (getTrackSound reads it), and the drift re-sync effect
+        // compares identities — an unpersisted copy reads as "no sound" forever
+        // and gets re-pushed to the engine on every panel load.
         const copyPreset = async (newTrackId: string, sourceDbId: string): Promise<string> => {
           if (!host.getTrackSound) return 'default';
           const snap = await host.getTrackSound(sourceDbId);
           if (!snap || snap.kind !== 'preset') return 'default';
           await applySynthSound(newTrackId, { state: snap.state, stateType: snap.stateType });
+          await host.persistTrackPresetState?.(newTrackId, { state: snap.state, stateType: snap.stateType, name: snap.label }).catch(() => {});
           return snap.label;
         };
         const originLabel = await copyPreset(top.id, origin.dbId);
@@ -937,12 +942,15 @@ export function SynthGeneratorPanel({
         // 3. MIDI.
         await host.writeMidiClip(track.id, clip);
 
-        // 4. Copy the source preset (exact sound — no shuffle).
+        // 4. Copy the source preset (exact sound — no shuffle). Persist it as the
+        // layer's preset_state — its durable identity for the drift re-sync
+        // (an unpersisted copy reads as "no sound" and gets re-pushed every load).
         let soundLabel = 'default';
         if (host.getTrackSound) {
           const snap = await host.getTrackSound(selection.dbId);
           if (snap && snap.kind === 'preset') {
             await applySynthSound(track.id, { state: snap.state, stateType: snap.stateType });
+            await host.persistTrackPresetState?.(track.id, { state: snap.state, stateType: snap.stateType, name: snap.label }).catch(() => {});
             soundLabel = snap.label;
           }
         }
@@ -1778,12 +1786,22 @@ export function SynthGeneratorPanel({
 
   // Auto re-sync drifted source presets. A crossfade/fade COPIES each source's
   // preset onto its layer at creation; if the user later changes the source
-  // track's preset, the transition is stale. On every load (mount / scene change
-  // / agent mutation), re-read source + layer sounds and, if the source's
-  // state-aware identity differs, re-copy it onto the layer (the layer is locked,
-  // so divergence == the source drifted). Keyed by engine id; cheap when in sync.
+  // track's preset, the transition is stale. Re-read source + layer sounds and,
+  // if the source's state-aware identity differs, re-copy it onto the layer (the
+  // layer is locked, so divergence == the source drifted) AND persist it so the
+  // check converges. Runs once per layer↔source membership, not per render —
+  // the resolved memos get fresh array identities on EVERY tracks change
+  // (volume tick, mute, …), which used to re-push full state blobs to the
+  // engine continuously while a transition scene was open.
+  const lastResyncKeyRef = useRef('');
   useEffect(() => {
     if (!host.getTrackSound || (resolvedCrossfadePairs.length === 0 && resolvedFades.length === 0)) return;
+    const resyncKey = [
+      ...resolvedCrossfadePairs.map((p) => `${p.origin.handle.dbId}<${p.originSourceDbId}|${p.target.handle.dbId}<${p.targetSourceDbId}`),
+      ...resolvedFades.map((f) => `${f.track.handle.dbId}<${f.meta.sourceTrackDbId}`),
+    ].join(',');
+    if (resyncKey === lastResyncKeyRef.current) return;
+    lastResyncKeyRef.current = resyncKey;
     let cancelled = false;
     const reapplyIfDrifted = async (layerTrackId: string, layerDbId: string, sourceDbId: string): Promise<void> => {
       if (!host.getTrackSound || cancelled) return;
@@ -1793,7 +1811,12 @@ export function SynthGeneratorPanel({
       ]);
       if (cancelled || !sourceSnap || sourceSnap.kind !== 'preset') return;
       if (soundIdentity(sourceSnap) === soundIdentity(layerSnap)) return;
-      await applySynthSound(layerTrackId, { state: sourceSnap.state, stateType: sourceSnap.stateType }).catch(() => {});
+      try {
+        await applySynthSound(layerTrackId, { state: sourceSnap.state, stateType: sourceSnap.stateType });
+        // Persist the layer's new identity — without this the drift check can
+        // never converge and the state gets re-pushed on every pass.
+        await host.persistTrackPresetState?.(layerTrackId, { state: sourceSnap.state, stateType: sourceSnap.stateType, name: sourceSnap.label });
+      } catch { /* best effort — retried on next membership change/reopen */ }
     };
     void (async () => {
       for (const pair of resolvedCrossfadePairs) {
