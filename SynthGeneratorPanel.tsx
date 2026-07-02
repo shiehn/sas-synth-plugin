@@ -837,7 +837,8 @@ export function SynthGeneratorPanel({
           const snap = await host.getTrackSound(sourceDbId);
           if (!snap || snap.kind !== 'preset') return 'default';
           await applySynthSound(newTrackId, { state: snap.state, stateType: snap.stateType });
-          await host.persistTrackPresetState?.(newTrackId, { state: snap.state, stateType: snap.stateType, name: snap.label }).catch(() => {});
+          // Absent stateType ⇒ ValueTree (same fallback applySynthSound uses).
+          await host.persistTrackPresetState?.(newTrackId, { state: snap.state, stateType: snap.stateType ?? 'valuetree', name: snap.label }).catch(() => {});
           return snap.label;
         };
         const originLabel = await copyPreset(top.id, origin.dbId);
@@ -950,7 +951,8 @@ export function SynthGeneratorPanel({
           const snap = await host.getTrackSound(selection.dbId);
           if (snap && snap.kind === 'preset') {
             await applySynthSound(track.id, { state: snap.state, stateType: snap.stateType });
-            await host.persistTrackPresetState?.(track.id, { state: snap.state, stateType: snap.stateType, name: snap.label }).catch(() => {});
+            // Absent stateType ⇒ ValueTree (same fallback applySynthSound uses).
+            await host.persistTrackPresetState?.(track.id, { state: snap.state, stateType: snap.stateType ?? 'valuetree', name: snap.label }).catch(() => {});
             soundLabel = snap.label;
           }
         }
@@ -1815,7 +1817,7 @@ export function SynthGeneratorPanel({
         await applySynthSound(layerTrackId, { state: sourceSnap.state, stateType: sourceSnap.stateType });
         // Persist the layer's new identity — without this the drift check can
         // never converge and the state gets re-pushed on every pass.
-        await host.persistTrackPresetState?.(layerTrackId, { state: sourceSnap.state, stateType: sourceSnap.stateType, name: sourceSnap.label });
+        await host.persistTrackPresetState?.(layerTrackId, { state: sourceSnap.state, stateType: sourceSnap.stateType ?? 'valuetree', name: sourceSnap.label });
       } catch { /* best effort — retried on next membership change/reopen */ }
     };
     void (async () => {
