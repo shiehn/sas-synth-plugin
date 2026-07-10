@@ -70,6 +70,8 @@ Rules:
 - velocity: 1-127
 - Keep notes within the key and scale provided
 - Match the style described in the prompt
+- If "Concurrent tracks in scene" are listed, compose to COMPLEMENT them: lock to the bassline's root motion, avoid clashing with notes already sounding, don't double another part's rhythm note-for-note, and leave rhythmic space (rests are part of the groove).
+- If "REFERENCE TRACKS" are listed, treat them as the parts you are writing AGAINST (counterpoint): interlock onsets rather than attacking together, favor contrary or oblique motion against their contour, prefer chord tones on strong beats with passing/neighbor tones on weak beats, and stay clear of the registers where they are busy.
 - role: instrument role — MUST be one of: ${validRoles.join(', ')}`;
 }
 
