@@ -177,7 +177,8 @@ async function generateSynthTrack(
   // the user chose their sound, don't overwrite it.
   if (!track.instrumentPluginId) {
     try {
-      await host.shufflePreset(trackId);
+      // Live prompt from panel state → semantic (vector-proximity) retrieval.
+      await host.shufflePreset(trackId, undefined, { description: track.prompt });
     } catch {
       // Non-fatal — track still has MIDI, just default preset
     }
@@ -242,7 +243,9 @@ function createSynthGeneratorAdapter(host: PluginHost): GeneratorPanelAdapter {
     sound: createSurgeSoundAdapter(host),
     shuffle: {
       shuffle: async (track: GeneratorTrackState, excludeNames: string[]) => {
-        const result = await host.shufflePreset(track.handle.id, excludeNames);
+        const result = await host.shufflePreset(track.handle.id, excludeNames, {
+          description: track.prompt,
+        });
         return { appliedName: result.presetName };
       },
       isExhaustedError: (err: unknown) =>
