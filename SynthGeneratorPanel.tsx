@@ -34,10 +34,17 @@ import {
   createSurgeSoundAdapter,
   formatConcurrentTracks,
   parseLLMNoteResponse,
+  panelClipEndSeconds,
+  panelMeter,
+  panelQuarterNotesPerBar,
   type GeneratorPanelAdapter,
   type GenerationServices,
   type GeneratorTrackState,
 } from '@signalsandsorcery/plugin-sdk';
+// The MIDI system prompt lives in src/synth-system-prompt.ts (testable module;
+// meter-aware since P8a — 4/4 output is byte-pinned by
+// __tests__/meter-prompt.test.ts).
+import { buildMidiSystemPrompt } from './src/synth-system-prompt';
 
 // ============================================================================
 // Constants
@@ -45,35 +52,6 @@ import {
 
 const MAX_TRACKS = 16;
 const ESTIMATED_GENERATION_MS = 15000;
-
-/**
- * Build the MIDI system prompt using the host's canonical role list
- * (host.getValidRoles()) so the LLM emits a role value the classifier
- * understands. See `src/music-engine/constants/instrument-classification.ts`
- * — the assistant-side single source of truth.
- */
-function buildMidiSystemPrompt(validRoles: readonly string[]): string {
-  return `You are a MIDI composition AI. Given a musical context and text description, generate MIDI notes.
-
-Respond with ONLY a JSON object in this format:
-{
-  "notes": [
-    { "pitch": 60, "startBeat": 0, "durationBeats": 1, "velocity": 100 }
-  ],
-  "role": "bass"
-}
-
-Rules:
-- pitch: MIDI note number 0-127
-- startBeat: position in quarter-note beats from start of clip (0-based)
-- durationBeats: duration in quarter-note beats
-- velocity: 1-127
-- Keep notes within the key and scale provided
-- Match the style described in the prompt
-- If "Concurrent tracks in scene" are listed, compose to COMPLEMENT them: lock to the bassline's root motion, avoid clashing with notes already sounding, don't double another part's rhythm note-for-note, and leave rhythmic space (rests are part of the groove).
-- If "REFERENCE TRACKS" are listed, treat them as the parts you are writing AGAINST (counterpoint): interlock onsets rather than attacking together, favor contrary or oblique motion against their contour, prefer chord tones on strong beats with passing/neighbor tones on weak beats, and stay clear of the registers where they are busy.
-- role: instrument role — MUST be one of: ${validRoles.join(', ')}`;
-}
 
 // ============================================================================
 // Synth generation strategy (single track: LLM → clip → mute → role → preset)
@@ -114,9 +92,10 @@ async function generateSynthTrack(
   );
   const userPrompt = promptParts.join('\n');
 
-  // 5. Call LLM (host auto-prefixes musical context)
+  // 5. Call LLM (host auto-prefixes musical context). The scene meter appends
+  // the family meter rules on non-4/4 scenes (4/4 = legacy byte-identical).
   const llmResult = await host.generateWithLLM({
-    system: buildMidiSystemPrompt(host.getValidRoles()),
+    system: buildMidiSystemPrompt(host.getValidRoles(), panelMeter(musicalContext)),
     user: userPrompt,
     responseFormat: 'json',
   });
@@ -133,10 +112,10 @@ async function generateSynthTrack(
     removeOverlaps: true,
   });
 
-  // 8. Write MIDI clip
+  // 8. Write MIDI clip (loop span sized by the scene meter; 4/4 = legacy)
   const clipData: MidiClipData = {
     startTime: 0,
-    endTime: (musicalContext.bars * 4 * 60) / musicalContext.bpm,
+    endTime: panelClipEndSeconds(musicalContext),
     tempo: musicalContext.bpm,
     notes: processedNotes,
   };
@@ -197,6 +176,7 @@ async function generateSynthTrack(
     editNotes: processedNotes,
     editBars: musicalContext.bars,
     editBpm: musicalContext.bpm,
+    editBeatsPerBar: panelQuarterNotesPerBar(musicalContext),
   }));
   services.markEditLoaded(trackId);
   // Fresh baseline — clear history; the next shuffle lazy-seeds this preset.
