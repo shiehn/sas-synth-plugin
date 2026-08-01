@@ -207,6 +207,12 @@ function createSynthGeneratorAdapter(host: PluginHost): GeneratorPanelAdapter {
       exportMidi: true,
       transitionDesigner: true,
       importTracks: true,
+      // Bus-strip DSP clusters (DUCK + WOB): kick-derived sidechain pump
+      // (ghost grids work with no kicks) and tempo-locked motion — filter
+      // wobble, amp gate/tremolo, auto-pan. Rendered per-sample in the
+      // engine, identical live and bounced.
+      busSidechain: true,
+      busMotion: true,
     },
     createTrackOptions: () => ({ loadSynth: true, synthName: 'Surge XT' }),
     // Native, role-appropriate Surge preset (keeps the default patch on failure).
