@@ -213,6 +213,11 @@ function createSynthGeneratorAdapter(host: PluginHost): GeneratorPanelAdapter {
       // engine, identical live and bounced.
       busSidechain: true,
       busMotion: true,
+      // Alt-tracks: pair two synth tracks as interchangeable ALTERNATIVES
+      // (e.g. the same lead with a different preset). They rotate one per
+      // loop instead of stacking, and the arranger staggers them across the
+      // arrangement. Synth is the first panel to carry this.
+      altTracks: true,
     },
     createTrackOptions: () => ({ loadSynth: true, synthName: 'Surge XT' }),
     // Native, role-appropriate Surge preset (keeps the default patch on failure).
