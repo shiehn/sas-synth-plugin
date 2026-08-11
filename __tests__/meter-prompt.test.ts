@@ -7,7 +7,9 @@
  * parameter landed, the 4/4 prompt — with the parameter omitted OR passed
  * explicitly as '4/4' — must still match that snapshot byte-for-byte. Never
  * update this snapshot as part of a meter change; a diff here means 4/4
- * behavior drifted.
+ * behavior drifted. Last deliberately revised 2026-08-10 (hand-edited snap)
+ * to add the RHYTHM ANCHORS bullet — kick/sub pins moved out of the
+ * counterpoint header into their own lock-to header.
  */
 import { describe, it, expect } from '@jest/globals';
 import { buildMidiSystemPrompt } from '../src/synth-system-prompt';

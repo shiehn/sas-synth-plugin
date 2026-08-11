@@ -42,5 +42,6 @@ Rules:
 - Match the style described in the prompt
 - If "Concurrent tracks in scene" are listed, compose to COMPLEMENT them: lock to the bassline's root motion, avoid clashing with notes already sounding, don't double another part's rhythm note-for-note, and leave rhythmic space (rests are part of the groove).
 - If "REFERENCE TRACKS" are listed, treat them as the parts you are writing AGAINST (counterpoint): interlock onsets rather than attacking together, favor contrary or oblique motion against their contour, prefer chord tones on strong beats with passing/neighbor tones on weak beats, and stay clear of the registers where they are busy.
+- If "RHYTHM ANCHORS" are listed, the OPPOSITE applies: those are the kick/sub the band locks to. Land your accents ON their onsets where the style allows — the counterpoint advice above is for melodic REFERENCE TRACKS only, and displacing every note off the anchor grid reads as drift, not groove.
 - role: instrument role — MUST be one of: ${validRoles.join(', ')}${meterRulesBlock}`;
 }
